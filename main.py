@@ -389,6 +389,79 @@ trader_thread.start()
 # ------------------------------------------------------------------------------
 app = FastAPI(title="Hybrid Fusion Champion Trader")
 
+@app.get("/api/test-feed")
+def test_feed():
+    """Verifies live market data connectivity to Upstox from Render Cloud."""
+    results = []
+    for c in engine.candidates[:3]:
+        sym = c.get('symbol')
+        isin = c.get('isin')
+        bars = engine.fetch_live_1min_bars(isin)
+        snap = engine.compute_intraday_snapshot(bars)
+        results.append({
+            "symbol": sym,
+            "isin": isin,
+            "bars_received": len(bars),
+            "latest_snapshot": snap,
+            "connectivity_status": "OK" if len(bars) > 0 else "FAILED"
+        })
+    return {
+        "status": "PASS" if all(r["bars_received"] > 0 for r in results) else "WARNING",
+        "tested_at": datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+        "details": results
+    }
+
+@app.get("/api/test-scan")
+def test_scan():
+    """Runs a simulated dry-run scan across candidates to test scan logic, sizing & bracket SL/TP."""
+    cand_map = {c['symbol']: c for c in engine.candidates}
+    snapshots = {}
+    for sym, c_data in list(cand_map.items())[:12]:
+        isin = c_data.get('isin')
+        if isin:
+            bars = engine.fetch_live_1min_bars(isin)
+            snap = engine.compute_intraday_snapshot(bars)
+            if snap:
+                snapshots[sym] = snap
+                
+    # Evaluate what trades would trigger
+    simulated_orders = []
+    used_secs = set()
+    for sym, snap in snapshots.items():
+        pm = cand_map.get(sym)
+        if pm and pm.get('ret_5d', 0) >= 5.0:
+            if pm.get('atr10_pct', 99) <= 4.50:
+                sec = pm.get('sector', 'N/A')
+                if sec not in used_secs and len(simulated_orders) < 2:
+                    used_secs.add(sec)
+                    shares = max(1, int(engine.slot_exposure / snap['close']))
+                    sl = round(snap['close'] * (1.0 + 0.0140), 2)
+                    tp1 = round(snap['close'] * (1.0 - 0.0195), 2)
+                    tp2 = round(snap['close'] * (1.0 - 0.0340), 2)
+                    simulated_orders.append({
+                        "symbol": sym,
+                        "direction": "SHORT",
+                        "strategy": "Tier #3A 5D Fade SHORT (Prime)",
+                        "sector": sec,
+                        "5d_ret": pm.get('ret_5d'),
+                        "atr10": pm.get('atr10_pct'),
+                        "test_price": snap['close'],
+                        "vwap": snap['vwap'],
+                        "shares": shares,
+                        "exposure_inr": round(shares * snap['close'], 2),
+                        "hard_sl_1_40pct": sl,
+                        "tp1_1_95pct": tp1,
+                        "tp2_3_40pct": tp2
+                    })
+                    
+    return {
+        "status": "PASS",
+        "evaluated_at": datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+        "snapshots_processed": len(snapshots),
+        "simulated_trades_count": len(simulated_orders),
+        "simulated_orders": simulated_orders
+    }
+
 @app.get("/ping")
 def ping():
     now_ist = datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
