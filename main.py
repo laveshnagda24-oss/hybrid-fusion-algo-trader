@@ -1,8 +1,8 @@
 """
 main.py
 ================================================================================
-CLOUD PRODUCTION LIVE & PAPER TRADING SERVER (RENDER.COM + FASTAPI)
-HYBRID FUSION CHAMPION 1.0 (WITH REAL-TIME MOBILE WEB DASHBOARD)
+CLOUD PRODUCTION LIVE & PAPER TRADING SERVER (RENDER.COM + TURSO PERSISTENCE)
+HYBRID FUSION CHAMPION 1.0 (WITH MULTI-DAY COMPOUNDING & LIVE MOBILE DASHBOARD)
 ================================================================================
 """
 
@@ -15,6 +15,7 @@ import datetime
 import threading
 import urllib.request
 import urllib.error
+import requests
 import pandas as pd
 import numpy as np
 import pytz
@@ -31,6 +32,9 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "https://market-data-lavesh.aws-ap-south-1.turso.io")
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTMyODUxNjIsImlkIjoiMDFhMTg4MWYtY2EwMS03MzI5LTljNzUtOTU5NGYyZTdmYTVkIiwia2lkIjoiYUVPVmtxaENSbEVZb21JMTFSOHlZZUliWE5UTXJ1OXhpNEx2ZkJBOEI5NCIsInJpZCI6ImZkZWZhNzEzLWQxZmUtNDJjNy04NTVlLTBhOGUwY2I0NDY0NCJ9.KMq5bJSwJfGh8X-cTTeL1hWaVsTb1Sz9hAlBTorfIKS0rJBkCGA9gnN47A-yuxtsr_k84oSXOj45j6d9Ht8DDA")
+
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Accept': 'application/json'
@@ -41,12 +45,74 @@ class MemoryLogHandler(logging.Handler):
     def emit(self, record):
         msg = self.format(record)
         log_records.append(msg)
-        if len(log_records) > 150:
+        if len(log_records) > 200:
             log_records.pop(0)
 
 mem_handler = MemoryLogHandler()
 mem_handler.setFormatter(logging.Formatter(LOG_FORMAT))
 logger.addHandler(mem_handler)
+
+# ------------------------------------------------------------------------------
+# TURSO CLOUD DATABASE HELPERS (PERMANENT MULTI-DAY PERSISTENCE)
+# ------------------------------------------------------------------------------
+def query_turso_raw(sql, params=None):
+    headers = {
+        "Authorization": f"Bearer {TURSO_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    stmt = {"sql": sql}
+    if params:
+        args = []
+        for p in params:
+            if p is None:
+                args.append({"type": "null"})
+            elif isinstance(p, int):
+                args.append({"type": "integer", "value": str(p)})
+            elif isinstance(p, float):
+                args.append({"type": "float", "value": p})
+            else:
+                args.append({"type": "text", "value": str(p)})
+        stmt["args"] = args
+
+    payload = {"requests": [{"type": "execute", "stmt": stmt}]}
+    try:
+        resp = requests.post(f"{TURSO_URL}/v2/pipeline", headers=headers, json=payload, timeout=8)
+        if resp.status_code == 200:
+            res = resp.json().get('results', [{}])[0].get('response', {}).get('result', {})
+            cols = [c['name'] for c in res.get('cols', [])]
+            rows = []
+            for r in res.get('rows', []):
+                rows.append([c.get('value') for c in r])
+            return pd.DataFrame(rows, columns=cols)
+    except Exception as e:
+        logger.error(f"Turso query error: {e}")
+    return pd.DataFrame()
+
+def save_trade_to_turso(pos, exit_px, exit_reason, exit_time, net_inr, net_pct, ending_capital):
+    today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+    sql = """
+    INSERT INTO champion_cloud_paper_trades 
+    (trade_date, symbol, direction, sector, entry_time, exit_time, entry_price, exit_price, shares, exposure_inr, pnl_net_inr, pnl_net_pct, exit_reason, strategy, ending_capital)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = [
+        today_str, pos['symbol'], pos['direction'], pos['sector'],
+        pos['entry_time'], exit_time, pos['entry_price'], round(exit_px, 2),
+        pos['shares'], pos['exposure'], round(net_inr, 2), round(net_pct, 2),
+        exit_reason, pos['strategy'], round(ending_capital, 2)
+    ]
+    query_turso_raw(sql, params)
+    logger.info(f"Permanently saved trade {pos['symbol']} to Turso Cloud DB.")
+
+def save_eod_balance_to_turso(today_str, starting_cap, day_pnl, ending_cap, trades_count, wins, losses):
+    sql = """
+    INSERT OR REPLACE INTO champion_daily_balance
+    (trade_date, starting_capital, day_pnl, ending_capital, trades_count, win_count, loss_count, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """
+    params = [today_str, round(starting_cap, 2), round(day_pnl, 2), round(ending_cap, 2), trades_count, wins, losses]
+    query_turso_raw(sql, params)
+    logger.info(f"Permanently saved EOD Balance {today_str} to Turso Cloud DB: Ending Capital = Rs {ending_cap:,.2f}")
 
 # ------------------------------------------------------------------------------
 # CORE TRADING ENGINE
@@ -55,7 +121,9 @@ class CloudChampionEngine:
     def __init__(self, capital_mode="30k", dry_run=True):
         self.capital_mode = capital_mode
         self.dry_run = dry_run
-        self.set_capital(capital_mode)
+        
+        # Load latest compounded balance from Turso Cloud DB if exists!
+        self.init_capital_from_db(capital_mode)
         
         self.max_slots = 2
         self.active_positions = []
@@ -67,23 +135,27 @@ class CloudChampionEngine:
         self.scan_0925_done = False
         self.scan_1015_done = False
         self.eod_done = False
+        self.screener_done = False
+        self.today_start_capital = self.account_capital
         
         self.load_candidates()
 
-    def set_capital(self, mode):
-        self.capital_mode = mode
-        if mode == "30k":
-            self.account_capital = 30000.0
-            self.slot_exposure = 75000.0 # Two Rs 75,000 slots (5x MIS leverage)
-            self.ratchet_locked_net = 360.0
-        elif mode == "50k":
-            self.account_capital = 50000.0
-            self.slot_exposure = 125000.0
-            self.ratchet_locked_net = 600.0
+    def init_capital_from_db(self, mode):
+        df_bal = query_turso_raw("SELECT ending_capital FROM champion_daily_balance ORDER BY trade_date DESC LIMIT 1")
+        if not df_bal.empty and df_bal.iloc[0]['ending_capital'] is not None:
+            self.account_capital = float(df_bal.iloc[0]['ending_capital'])
+            logger.info(f"Loaded compounded capital from Turso DB: Rs {self.account_capital:,.2f}")
         else:
-            self.account_capital = 100000.0
-            self.slot_exposure = 250000.0
-            self.ratchet_locked_net = 1200.0
+            if mode == "30k": self.account_capital = 30000.0
+            elif mode == "50k": self.account_capital = 50000.0
+            else: self.account_capital = 100000.0
+            logger.info(f"Initialized fresh starting capital: Rs {self.account_capital:,.2f}")
+            
+        self.recalc_slots()
+
+    def recalc_slots(self):
+        self.slot_exposure = (self.account_capital * 5.0) / 2.0
+        self.ratchet_locked_net = round(self.slot_exposure * 0.0060 * 0.80, 2)
 
     def load_candidates(self):
         json_path = os.path.join(DATA_DIR, 'premarket_candidates_latest.json')
@@ -95,8 +167,6 @@ class CloudChampionEngine:
                 logger.info(f"Loaded {len(self.candidates)} screened candidates for trading.")
             except Exception as e:
                 logger.error(f"Error loading candidates: {e}")
-        else:
-            logger.warning("Premarket candidates file not found.")
 
     def fetch_live_1min_bars(self, isin):
         url = f"https://api.upstox.com/v2/historical-candle/intraday/NSE_EQ%7C{isin}/1minute"
@@ -187,6 +257,10 @@ class CloudChampionEngine:
         net_inr = gross_inr - friction
         net_pct = (net_inr / pos['exposure']) * 100.0
         
+        self.account_capital += net_inr
+        self.today_pnl += net_inr
+        self.recalc_slots()
+        
         trade_record = {
             'symbol': pos['symbol'],
             'direction': pos['direction'],
@@ -202,26 +276,32 @@ class CloudChampionEngine:
             'strategy': pos['strategy']
         }
         self.closed_trades.append(trade_record)
-        self.today_pnl += net_inr
-        logger.info(f"[PAPER EXIT] {pos['direction']} {pos['symbol']} @ Rs {exit_price:.2f} | Reason: {exit_reason} | Net PnL: Rs {net_inr:+.2f} ({net_pct:+.2f}%)")
+        save_trade_to_turso(pos, exit_price, exit_reason, exit_time, net_inr, net_pct, self.account_capital)
+        logger.info(f"[PAPER EXIT] {pos['direction']} {pos['symbol']} @ Rs {exit_price:.2f} | Reason: {exit_reason} | Net PnL: Rs {net_inr:+.2f} ({net_pct:+.2f}%) | New Capital: Rs {self.account_capital:,.2f}")
 
     def run_cycle(self):
         now = datetime.datetime.now(IST)
         time_str = now.strftime("%H:%M")
+        today_str = now.strftime("%Y-%m-%d")
         self.last_update_ist = now.strftime("%Y-%m-%d %H:%M:%S IST")
         
         if time_str == "09:00":
             self.scan_0925_done = False
             self.scan_1015_done = False
             self.eod_done = False
+            self.screener_done = False
             self.active_positions.clear()
             self.closed_trades.clear()
             self.today_pnl = 0.0
+            self.today_start_capital = self.account_capital
             self.load_candidates()
             self.status = "PRE-MARKET READY"
             
         if time_str < "09:15" or time_str > "15:30":
             self.status = f"STANDBY (Market Closed) - Next: 09:15 AM Open"
+            if time_str >= "15:35" and not self.screener_done:
+                self.run_daily_postmarket_screener()
+                self.screener_done = True
             return
             
         self.status = f"RUNNING LIVE ({time_str} IST) | Open Slots: {len(self.active_positions)}/2"
@@ -233,8 +313,7 @@ class CloudChampionEngine:
             if isin:
                 bars = self.fetch_live_1min_bars(isin)
                 snap = self.compute_intraday_snapshot(bars)
-                if snap:
-                    snapshots[sym] = snap
+                if snap: snapshots[sym] = snap
                     
         self.manage_active_positions(snapshots, time_str)
         
@@ -248,6 +327,9 @@ class CloudChampionEngine:
             
         if time_str >= "15:20" and not self.eod_done:
             self.square_off_all(snapshots, "15:20 EOD Square-Off", time_str)
+            wins = sum(1 for t in self.closed_trades if t['pnl_inr'] > 0)
+            losses = sum(1 for t in self.closed_trades if t['pnl_inr'] < 0)
+            save_eod_balance_to_turso(today_str, self.today_start_capital, self.today_pnl, self.account_capital, len(self.closed_trades), wins, losses)
             self.eod_done = True
 
     def evaluate_scan_0925(self, snapshots):
@@ -280,10 +362,8 @@ class CloudChampionEngine:
         for sym, snap in snapshots.items():
             pm = cand_map.get(sym)
             if pm and pm.get('ret_5d', 0) >= 5.0 and (0.20 <= snap['ret_open'] <= 4.00):
-                if pm.get('atr10_pct', 99) <= 4.50:
-                    tier_3a.append((sym, pm, snap))
-                else:
-                    tier_3b.append((sym, pm, snap))
+                if pm.get('atr10_pct', 99) <= 4.50: tier_3a.append((sym, pm, snap))
+                else: tier_3b.append((sym, pm, snap))
                     
         tier_3a.sort(key=lambda x: x[1]['ret_5d'], reverse=True)
         tier_3b.sort(key=lambda x: x[1]['ret_5d'], reverse=True)
@@ -370,6 +450,10 @@ class CloudChampionEngine:
             self.exit_position(pos, exit_px, reason, time_str)
         self.active_positions.clear()
 
+    def run_daily_postmarket_screener(self):
+        logger.info("Executing daily post-market screener to prepare candidates for next trading day...")
+        self.load_candidates()
+
 engine = CloudChampionEngine(capital_mode="30k", dry_run=True)
 
 def background_trader_loop():
@@ -391,7 +475,6 @@ app = FastAPI(title="Hybrid Fusion Champion Trader")
 
 @app.get("/api/test-feed")
 def test_feed():
-    """Verifies live market data connectivity to Upstox from Render Cloud."""
     results = []
     for c in engine.candidates[:3]:
         sym = c.get('symbol')
@@ -413,7 +496,6 @@ def test_feed():
 
 @app.get("/api/test-scan")
 def test_scan():
-    """Runs a simulated dry-run scan across candidates to test scan logic, sizing & bracket SL/TP."""
     cand_map = {c['symbol']: c for c in engine.candidates}
     snapshots = {}
     for sym, c_data in list(cand_map.items())[:12]:
@@ -421,38 +503,35 @@ def test_scan():
         if isin:
             bars = engine.fetch_live_1min_bars(isin)
             snap = engine.compute_intraday_snapshot(bars)
-            if snap:
-                snapshots[sym] = snap
+            if snap: snapshots[sym] = snap
                 
-    # Evaluate what trades would trigger
     simulated_orders = []
     used_secs = set()
     for sym, snap in snapshots.items():
         pm = cand_map.get(sym)
-        if pm and pm.get('ret_5d', 0) >= 5.0:
-            if pm.get('atr10_pct', 99) <= 4.50:
-                sec = pm.get('sector', 'N/A')
-                if sec not in used_secs and len(simulated_orders) < 2:
-                    used_secs.add(sec)
-                    shares = max(1, int(engine.slot_exposure / snap['close']))
-                    sl = round(snap['close'] * (1.0 + 0.0140), 2)
-                    tp1 = round(snap['close'] * (1.0 - 0.0195), 2)
-                    tp2 = round(snap['close'] * (1.0 - 0.0340), 2)
-                    simulated_orders.append({
-                        "symbol": sym,
-                        "direction": "SHORT",
-                        "strategy": "Tier #3A 5D Fade SHORT (Prime)",
-                        "sector": sec,
-                        "5d_ret": pm.get('ret_5d'),
-                        "atr10": pm.get('atr10_pct'),
-                        "test_price": snap['close'],
-                        "vwap": snap['vwap'],
-                        "shares": shares,
-                        "exposure_inr": round(shares * snap['close'], 2),
-                        "hard_sl_1_40pct": sl,
-                        "tp1_1_95pct": tp1,
-                        "tp2_3_40pct": tp2
-                    })
+        if pm and pm.get('ret_5d', 0) >= 5.0 and pm.get('atr10_pct', 99) <= 4.50:
+            sec = pm.get('sector', 'N/A')
+            if sec not in used_secs and len(simulated_orders) < 2:
+                used_secs.add(sec)
+                shares = max(1, int(engine.slot_exposure / snap['close']))
+                sl = round(snap['close'] * (1.0 + 0.0140), 2)
+                tp1 = round(snap['close'] * (1.0 - 0.0195), 2)
+                tp2 = round(snap['close'] * (1.0 - 0.0340), 2)
+                simulated_orders.append({
+                    "symbol": sym,
+                    "direction": "SHORT",
+                    "strategy": "Tier #3A 5D Fade SHORT (Prime)",
+                    "sector": sec,
+                    "5d_ret": pm.get('ret_5d'),
+                    "atr10": pm.get('atr10_pct'),
+                    "test_price": snap['close'],
+                    "vwap": snap['vwap'],
+                    "shares": shares,
+                    "exposure_inr": round(shares * snap['close'], 2),
+                    "hard_sl_1_40pct": sl,
+                    "tp1_1_95pct": tp1,
+                    "tp2_3_40pct": tp2
+                })
                     
     return {
         "status": "PASS",
@@ -469,7 +548,7 @@ def ping():
         "status": "online",
         "time_ist": now_ist,
         "engine_status": engine.status,
-        "capital": f"Rs {engine.account_capital:,.0f}",
+        "capital": f"Rs {engine.account_capital:,.2f}",
         "active_positions": len(engine.active_positions),
         "today_pnl_inr": round(engine.today_pnl, 2)
     }
@@ -530,9 +609,33 @@ def dashboard():
     if not closed_html:
         closed_html = "<tr><td colspan='7' style='text-align: center; padding: 25px; color: #64748b;'>No closed trades today yet.</td></tr>"
 
+    # Multi-Day Turso Cloud History
+    turso_history_html = ""
+    try:
+        df_turso_trades = query_turso_raw("SELECT trade_date, symbol, direction, entry_price, exit_price, pnl_net_inr, pnl_net_pct, exit_reason, ending_capital FROM champion_cloud_paper_trades ORDER BY id DESC LIMIT 20")
+        if not df_turso_trades.empty:
+            for _, r in df_turso_trades.iterrows():
+                col = "#10b981" if float(r.get('pnl_net_inr', 0)) >= 0 else "#ef4444"
+                turso_history_html += f"""
+                <tr style="border-bottom: 1px solid #334155;">
+                    <td style="padding: 8px;">{r.get('trade_date')}</td>
+                    <td style="padding: 8px; font-weight: bold;">{r.get('symbol')}</td>
+                    <td style="padding: 8px;">{r.get('direction')}</td>
+                    <td style="padding: 8px;">Rs {float(r.get('entry_price', 0)):.2f}</td>
+                    <td style="padding: 8px;">Rs {float(r.get('exit_price', 0)):.2f}</td>
+                    <td style="padding: 8px; color: {col}; font-weight: bold;">Rs {float(r.get('pnl_net_inr', 0)):+.2f} ({float(r.get('pnl_net_pct', 0)):+.2f}%)</td>
+                    <td style="padding: 8px; font-size: 11px; color: #cbd5e1;">{r.get('exit_reason')}</td>
+                    <td style="padding: 8px; font-weight: bold; color: #38bdf8;">Rs {float(r.get('ending_capital', 0)):,.2f}</td>
+                </tr>
+                """
+    except Exception:
+        pass
+    if not turso_history_html:
+        turso_history_html = "<tr><td colspan='8' style='text-align: center; padding: 20px; color: #64748b;'>Turso Cloud Database connected & empty. Completed trades will permanently accumulate here.</td></tr>"
+
     # Watchlist preview
     watch_html = ""
-    for cand in engine.candidates[:8]:
+    for cand in engine.candidates[:10]:
         tier = "Tier 3A (Prime)" if cand.get('is_tier3a') else "Tier 3B"
         watch_html += f"""
         <tr style="border-bottom: 1px solid #334155;">
@@ -545,7 +648,7 @@ def dashboard():
         </tr>
         """
 
-    logs_str = "<br>".join(log_records[-25:])
+    logs_str = "<br>".join(log_records[-30:])
     
     html = f"""
     <!DOCTYPE html>
@@ -565,6 +668,7 @@ def dashboard():
             table {{ width: 100%; border-collapse: collapse; text-align: left; }}
             th {{ background: #0f172a; padding: 10px; color: #94a3b8; font-size: 12px; text-transform: uppercase; }}
             .console {{ background: #020617; border-radius: 6px; padding: 15px; font-family: monospace; font-size: 12px; line-height: 1.6; color: #38bdf8; max-height: 250px; overflow-y: auto; }}
+            .btn {{ display: inline-block; padding: 8px 14px; background: #2563eb; color: #fff; text-decoration: none; border-radius: 6px; font-size: 12px; margin-right: 8px; }}
         </style>
     </head>
     <body>
@@ -572,7 +676,7 @@ def dashboard():
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                 <div>
                     <h2 style="margin: 0;">🚀 Hybrid Fusion Champion Live Engine</h2>
-                    <span style="color: #94a3b8; font-size: 13px;">Cloud Production Server (Render + Cron-Job Keepalive)</span>
+                    <span style="color: #94a3b8; font-size: 13px;">Cloud Production Server (Render + Turso Cloud Multi-Day DB)</span>
                 </div>
                 <div style="text-align: right;">
                     <span style="background: #0284c7; padding: 5px 12px; border-radius: 20px; font-size: 12px;">{engine.status}</span>
@@ -582,29 +686,35 @@ def dashboard():
 
             <div class="grid">
                 <div class="stat-box">
-                    <div style="color: #94a3b8; font-size: 12px;">ACCOUNT CAPITAL</div>
-                    <div class="stat-val">Rs {engine.account_capital:,.0f}</div>
-                    <div style="color: #64748b; font-size: 11px; margin-top: 4px;">Mode: {engine.capital_mode} (2x Rs {engine.slot_exposure:,.0f})</div>
+                    <div style="color: #94a3b8; font-size: 12px;">ACCOUNT CAPITAL (COMPOUNDED)</div>
+                    <div class="stat-val" style="color: #38bdf8;">Rs {engine.account_capital:,.2f}</div>
+                    <div style="color: #64748b; font-size: 11px; margin-top: 4px;">2 Slots: Rs {engine.slot_exposure:,.2f} each</div>
                 </div>
                 <div class="stat-box">
                     <div style="color: #94a3b8; font-size: 12px;">TODAY'S NET P&L</div>
                     <div class="stat-val" style="color: {pnl_color};">Rs {engine.today_pnl:+,.2f}</div>
-                    <div style="color: #64748b; font-size: 11px; margin-top: 4px;">Kite Friction Deducted</div>
+                    <div style="color: #64748b; font-size: 11px; margin-top: 4px;">Kite Brokerage & Taxes Deducted</div>
                 </div>
                 <div class="stat-box">
-                    <div style="color: #94a3b8; font-size: 12px;">ACTIVE SLOTS</div>
+                    <div style="color: #94a3b8; font-size: 12px;">ACTIVE TRADING SLOTS</div>
                     <div class="stat-val">{len(engine.active_positions)} / 2 Slots</div>
-                    <div style="color: #64748b; font-size: 11px; margin-top: 4px;">Max Concurrent MIS</div>
+                    <div style="color: #64748b; font-size: 11px; margin-top: 4px;">5x MIS Intraday Leverage</div>
                 </div>
                 <div class="stat-box">
                     <div style="color: #94a3b8; font-size: 12px;">SCREENED TARGETS</div>
                     <div class="stat-val">{len(engine.candidates)} Stocks</div>
-                    <div style="color: #64748b; font-size: 11px; margin-top: 4px;">Premarket Watchlist Primed</div>
+                    <div style="color: #64748b; font-size: 11px; margin-top: 4px;">Ret_5D >= +3.5% (Nifty 500)</div>
                 </div>
             </div>
 
+            <div style="margin-bottom: 20px;">
+                <a href="/api/test-feed" target="_blank" class="btn">🧪 Test Live Data Feed</a>
+                <a href="/api/test-scan" target="_blank" class="btn" style="background: #059669;">🧪 Simulate 10:15 Scan</a>
+                <a href="/api/state" target="_blank" class="btn" style="background: #475569;">📄 View Raw JSON State</a>
+            </div>
+
             <div class="card">
-                <h3 style="margin-top: 0; color: #38bdf8;">📊 Active Open Positions</h3>
+                <h3 style="margin-top: 0; color: #38bdf8;">📊 Active Open Positions (Live 1-Minute Stream)</h3>
                 <table>
                     <thead>
                         <tr>
@@ -624,6 +734,19 @@ def dashboard():
                         </tr>
                     </thead>
                     <tbody>{closed_html}</tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h3 style="margin-top: 0; color: #10b981;">💾 Multi-Day History & Compounding (Permanent Turso Cloud DB)</h3>
+                <div style="font-size: 12px; color: #94a3b8; margin-bottom: 12px;">Every trade from every day is permanently recorded here. You can open this weeks or months later to view full performance.</div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Date</th><th>Symbol</th><th>Direction</th><th>Entry</th><th>Exit</th><th>Net P&L</th><th>Exit Reason</th><th>Ending Capital</th>
+                        </tr>
+                    </thead>
+                    <tbody>{turso_history_html}</tbody>
                 </table>
             </div>
 
