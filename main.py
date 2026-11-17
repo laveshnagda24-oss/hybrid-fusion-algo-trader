@@ -210,7 +210,10 @@ class CloudChampionEngine:
         }
 
     def enter_position(self, sym, direction, entry_price, vwap, entry_time, strategy_name, sector='N/A'):
-        shares = max(1, int(self.slot_exposure / entry_price))
+        shares = max(2, int(self.slot_exposure / entry_price))
+        shares_l1 = shares // 2
+        shares_l2 = shares - shares_l1
+        
         sl_pct = 0.0120 if entry_time == '09:25' else 0.0140
         hard_sl = entry_price * (1.0 + sl_pct) if direction == 'SHORT' else entry_price * (1.0 - sl_pct)
         tp1 = entry_price * (1.0 - 0.0195) if direction == 'SHORT' else entry_price * (1.0 + 0.0195)
@@ -222,7 +225,10 @@ class CloudChampionEngine:
             'sector': sector,
             'entry_time': entry_time,
             'entry_price': round(entry_price, 2),
+            'total_shares': shares,
             'shares': shares,
+            'shares_l1': shares_l1,
+            'shares_l2': shares_l2,
             'exposure': round(shares * entry_price, 2),
             'current_price': round(entry_price, 2),
             'hard_sl': round(hard_sl, 2),
@@ -230,6 +236,9 @@ class CloudChampionEngine:
             'tp1': round(tp1, 2),
             'tp2': round(tp2, 2),
             'tp1_hit': False,
+            'l1_closed': False,
+            'l1_exit_px': None,
+            'l1_exit_time': None,
             'ratchet_locked': False,
             'strategy': strategy_name,
             'mfe_pct': 0.0,
@@ -238,24 +247,31 @@ class CloudChampionEngine:
             'pnl_pct': 0.0
         }
         self.active_positions.append(pos)
-        logger.info(f"[PAPER ORDER] ENTER {direction} {sym} @ Rs {entry_price:.2f} | Shares: {shares} | SL: Rs {hard_sl:.2f} | TP1: Rs {tp1:.2f} | Setup: {strategy_name}")
+        logger.info(f"[PAPER ORDER] ENTER {direction} {sym} @ Rs {entry_price:.2f} | Shares: {shares} (L1: {shares_l1}, L2: {shares_l2}) | SL: Rs {hard_sl:.2f} | TP1: Rs {tp1:.2f} | Setup: {strategy_name}")
 
-    def exit_position(self, pos, exit_price, exit_reason, exit_time):
+    def exit_position(self, pos, exit_price, exit_reason, exit_time, exit_leg="FULL"):
+        shares_to_exit = pos['shares']
+        if exit_leg == "LEG_1":
+            shares_to_exit = pos['shares_l1']
+        elif exit_leg == "LEG_2":
+            shares_to_exit = pos['shares_l2']
+            
+        leg_exposure = round(shares_to_exit * pos['entry_price'], 2)
         mult = 1.0 if pos['direction'] == 'LONG' else -1.0
         gross_pct = ((exit_price - pos['entry_price']) / pos['entry_price']) * 100.0 * mult
-        gross_inr = pos['exposure'] * (gross_pct / 100.0)
+        gross_inr = leg_exposure * (gross_pct / 100.0)
         
-        turnover = 2.0 * pos['exposure']
-        brok = 40.0 if not pos['tp1_hit'] else 60.0
-        stt = 0.00025 * pos['exposure']
+        turnover = 2.0 * leg_exposure
+        brok = 20.0
+        stt = 0.00025 * leg_exposure
         nse = 0.0000297 * turnover
         sebi = 0.000001 * turnover
-        stamp = 0.00003 * pos['exposure']
+        stamp = 0.00003 * leg_exposure
         gst = 0.18 * (brok + nse + sebi)
         friction = brok + stt + nse + sebi + stamp + gst
         
         net_inr = gross_inr - friction
-        net_pct = (net_inr / pos['exposure']) * 100.0
+        net_pct = (net_inr / leg_exposure) * 100.0 if leg_exposure > 0 else 0.0
         
         self.account_capital += net_inr
         self.today_pnl += net_inr
@@ -269,15 +285,15 @@ class CloudChampionEngine:
             'exit_time': exit_time,
             'entry_price': pos['entry_price'],
             'exit_price': round(exit_price, 2),
-            'shares': pos['shares'],
+            'shares': shares_to_exit,
             'pnl_inr': round(net_inr, 2),
             'pnl_pct': round(net_pct, 2),
-            'exit_reason': exit_reason,
+            'exit_reason': f"{exit_reason} [{exit_leg}]",
             'strategy': pos['strategy']
         }
         self.closed_trades.append(trade_record)
-        save_trade_to_turso(pos, exit_price, exit_reason, exit_time, net_inr, net_pct, self.account_capital)
-        logger.info(f"[PAPER EXIT] {pos['direction']} {pos['symbol']} @ Rs {exit_price:.2f} | Reason: {exit_reason} | Net PnL: Rs {net_inr:+.2f} ({net_pct:+.2f}%) | New Capital: Rs {self.account_capital:,.2f}")
+        save_trade_to_turso(pos, exit_price, f"{exit_reason} [{exit_leg}]", exit_time, net_inr, net_pct, self.account_capital)
+        logger.info(f"[PAPER EXIT] {pos['direction']} {pos['symbol']} ({exit_leg}) @ Rs {exit_price:.2f} | Reason: {exit_reason} | Net PnL: Rs {net_inr:+.2f} ({net_pct:+.2f}%) | New Capital: Rs {self.account_capital:,.2f}")
 
     def run_cycle(self):
         now = datetime.datetime.now(IST)
@@ -354,34 +370,67 @@ class CloudChampionEngine:
                 self.enter_position(sym, 'LONG', snap['close'], snap['vwap'], '09:25', 'Specialist #1: Panic Dip Bounce LONG')
 
     def evaluate_scan_1015(self, snapshots):
+        """Dual-Screener Consensus Engine (V4.1 + V9.0) mirroring pure 5-year model."""
         if len(self.active_positions) >= self.max_slots or not snapshots: return
         cand_map = {c['symbol']: c for c in self.candidates}
+        unanimous = []
         tier_3a = []
         tier_3b = []
+        
         for sym, snap in snapshots.items():
             pm = cand_map.get(sym)
-            if pm and pm.get('ret_5d', 0) >= 5.0 and (0.20 <= snap['ret_open'] <= 4.00):
-                if pm.get('atr10_pct', 99) <= 4.50: tier_3a.append((sym, pm, snap))
-                else: tier_3b.append((sym, pm, snap))
+            if not pm: continue
+            ret_5d = pm.get('ret_5d', 0.0)
+            atr10 = pm.get('atr10_pct', 99.0)
+            ret_open = snap.get('ret_open', 0.0)
+            close_px = snap['close']
+            vwap_px = snap['vwap']
+            day_high = snap.get('day_high', close_px)
+            
+            # Universal Overextension criteria
+            if ret_5d >= 5.0 and (0.20 <= ret_open <= 4.00):
+                # V9 criteria: non-squeeze ATR and price trading around/below VWAP
+                v9_pass = (atr10 <= 4.50) and (close_px <= vwap_px * 1.002)
+                # V4.1 criteria: non-squeeze ATR and not making new highs at scan time
+                v4_pass = (atr10 <= 4.50) and (day_high > close_px)
+                
+                if v9_pass and v4_pass:
+                    unanimous.append((sym, pm, snap, 'Unanimous Conviction SHORT (V4.1 + V9.0)'))
+                elif atr10 <= 4.50:
+                    tier_3a.append((sym, pm, snap, 'V4.1 Tier 3A Priority SHORT'))
+                else:
+                    tier_3b.append((sym, pm, snap, 'Specialist #3: Overextended 5D Fade SHORT'))
                     
+        unanimous.sort(key=lambda x: x[1]['ret_5d'], reverse=True)
         tier_3a.sort(key=lambda x: x[1]['ret_5d'], reverse=True)
         tier_3b.sort(key=lambda x: x[1]['ret_5d'], reverse=True)
         
+        # Priority 1: Unanimous Conviction (60% of all 5-year profit!)
         used_secs = {p['sector'] for p in self.active_positions}
-        for sym, pm, snap in tier_3a:
+        for sym, pm, snap, strat_name in unanimous:
             if len(self.active_positions) >= self.max_slots: break
             if pm.get('sector') in used_secs: continue
             used_secs.add(pm.get('sector'))
-            self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', 'Tier #3A 5D Fade SHORT (Prime)', sector=pm.get('sector', 'N/A'))
+            self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', strat_name, sector=pm.get('sector', 'N/A'))
             
+        # Priority 2: High Conviction Tier 3A
         if len(self.active_positions) < self.max_slots:
-            for sym, pm, snap in tier_3b:
+            for sym, pm, snap, strat_name in tier_3a:
                 if len(self.active_positions) >= self.max_slots: break
                 if pm.get('sector') in used_secs: continue
                 used_secs.add(pm.get('sector'))
-                self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', 'Tier #3B High-ATR Fade SHORT', sector=pm.get('sector', 'N/A'))
+                self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', strat_name, sector=pm.get('sector', 'N/A'))
+                
+        # Priority 3: Fallback Tier 3B
+        if len(self.active_positions) < self.max_slots:
+            for sym, pm, snap, strat_name in tier_3b:
+                if len(self.active_positions) >= self.max_slots: break
+                if pm.get('sector') in used_secs: continue
+                used_secs.add(pm.get('sector'))
+                self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', strat_name, sector=pm.get('sector', 'N/A'))
 
     def manage_active_positions(self, snapshots, time_str):
+        """2-Tranche Partial Exit Execution (Leg 1 50% @ TP1, Leg 2 50% Trailed / TP2)."""
         remaining = []
         for pos in self.active_positions:
             sym = pos['symbol']
@@ -401,30 +450,41 @@ class CloudChampionEngine:
             pos['pnl_inr'] = round(pos['exposure'] * (pnl_pct / 100.0), 2)
             if pnl_pct > pos['mfe_pct']: pos['mfe_pct'] = pnl_pct
             
-            # 1. Check Hard SL / Trailed Stop
-            if pos['direction'] == 'SHORT' and curr_px >= pos['current_sl']:
-                reason = 'Hard Stop-Loss Hit' if not pos['tp1_hit'] else 'Trailing Stop Hit (+1.40% locked)'
-                self.exit_position(pos, pos['current_sl'], reason, time_str)
-                continue
-            elif pos['direction'] == 'LONG' and curr_px <= pos['current_sl']:
-                reason = 'Hard Stop-Loss Hit' if not pos['tp1_hit'] else 'Trailing Stop Hit (+1.40% locked)'
-                self.exit_position(pos, pos['current_sl'], reason, time_str)
+            # 1. Check Hard SL / Trailed Stop Hit
+            if (pos['direction'] == 'SHORT' and curr_px >= pos['current_sl']) or (pos['direction'] == 'LONG' and curr_px <= pos['current_sl']):
+                if pos['l1_closed']:
+                    # Leg 1 was already booked at TP1; exit remaining Leg 2
+                    reason = 'Trailing Stop Hit (+1.40% locked)' if not pos['ratchet_locked'] else 'Afternoon Ratchet Hit (+0.60%)'
+                    self.exit_position(pos, pos['current_sl'], reason, time_str, exit_leg="LEG_2")
+                else:
+                    # Leg 1 was not hit; Hard SL hit on entire position
+                    self.exit_position(pos, pos['current_sl'], 'Hard Stop-Loss Hit (1.40%)', time_str, exit_leg="FULL")
                 continue
                 
-            # 2. Check TP1 Hit (+1.95%) -> Trail stop to lock +1.40% profit
+            # 2. Check TP1 Hit (+1.95%) -> Book Leg 1 (50% shares) & Trail Leg 2 to lock +1.40% profit!
             if not pos['tp1_hit']:
                 if (pos['direction'] == 'SHORT' and curr_px <= pos['tp1']) or (pos['direction'] == 'LONG' and curr_px >= pos['tp1']):
                     pos['tp1_hit'] = True
+                    pos['l1_closed'] = True
+                    pos['l1_exit_px'] = pos['tp1']
+                    pos['l1_exit_time'] = time_str
+                    
+                    # Exit 50% shares immediately at TP1
+                    self.exit_position(pos, pos['tp1'], 'Target 1 Reached (+1.95%)', time_str, exit_leg="LEG_1")
+                    
+                    # Trail Stop-Loss on remaining 50% shares to lock +1.40% profit
                     new_sl = pos['entry_price'] * (1.0 - 0.0140) if pos['direction'] == 'SHORT' else pos['entry_price'] * (1.0 + 0.0140)
                     pos['current_sl'] = round(new_sl, 2)
-                    logger.info(f"[TARGET 1 HIT] {pos['symbol']} reached +1.95%! SL trailed to lock +1.40% @ Rs {new_sl:.2f}")
+                    pos['shares'] = pos['shares_l2']
+                    pos['exposure'] = round(pos['shares_l2'] * pos['entry_price'], 2)
+                    logger.info(f"[2-TRANCHE TP1] {pos['symbol']} booked 50% @ TP1 (+1.95%)! Runner leg trailed to lock +1.40% @ Rs {new_sl:.2f}")
                     
-            # 3. Check TP2 Hit (+3.40%)
+            # 3. Check TP2 Hit (+3.40%) on Leg 2
             if (pos['direction'] == 'SHORT' and curr_px <= pos['tp2']) or (pos['direction'] == 'LONG' and curr_px >= pos['tp2']):
-                self.exit_position(pos, pos['tp2'], 'Target 2 Profit Reached (+3.40%)', time_str)
+                self.exit_position(pos, pos['tp2'], 'Target 2 Profit Reached (+3.40%)', time_str, exit_leg="LEG_2" if pos['l1_closed'] else "FULL")
                 continue
                 
-            # 4. Extended Dynamic Trailing after +1.50% MFE (pure 5-year model)
+            # 4. Extended Dynamic Trailing after +1.50% MFE on runner leg
             if pos['tp1_hit'] and pos['mfe_pct'] >= 1.50:
                 sgn = -1.0 if pos['direction'] == 'SHORT' else 1.0
                 dyn_px = round(pos['entry_price'] * (1.0 + sgn * (pos['mfe_pct'] - 0.35) / 100.0), 2)
@@ -448,7 +508,8 @@ class CloudChampionEngine:
         for pos in list(self.active_positions):
             snap = snapshots.get(pos['symbol'])
             exit_px = snap['close'] if snap else pos['current_price']
-            self.exit_position(pos, exit_px, reason, time_str)
+            exit_leg = "LEG_2" if pos.get('l1_closed', False) else "FULL"
+            self.exit_position(pos, exit_px, reason, time_str, exit_leg=exit_leg)
         self.active_positions.clear()
 
     def run_daily_postmarket_screener(self):
