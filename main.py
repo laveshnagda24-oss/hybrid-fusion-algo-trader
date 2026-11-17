@@ -211,7 +211,8 @@ class CloudChampionEngine:
 
     def enter_position(self, sym, direction, entry_price, vwap, entry_time, strategy_name, sector='N/A'):
         shares = max(1, int(self.slot_exposure / entry_price))
-        hard_sl = entry_price * (1.0 + 0.0140) if direction == 'SHORT' else entry_price * (1.0 - 0.0140)
+        sl_pct = 0.0120 if entry_time == '09:25' else 0.0140
+        hard_sl = entry_price * (1.0 + sl_pct) if direction == 'SHORT' else entry_price * (1.0 - sl_pct)
         tp1 = entry_price * (1.0 - 0.0195) if direction == 'SHORT' else entry_price * (1.0 + 0.0195)
         tp2 = entry_price * (1.0 - 0.0340) if direction == 'SHORT' else entry_price * (1.0 + 0.0340)
         
@@ -234,8 +235,7 @@ class CloudChampionEngine:
             'mfe_pct': 0.0,
             'vwap': vwap,
             'pnl_inr': 0.0,
-            'pnl_pct': 0.0,
-            'consecutive_vwap_violations': 0
+            'pnl_pct': 0.0
         }
         self.active_positions.append(pos)
         logger.info(f"[PAPER ORDER] ENTER {direction} {sym} @ Rs {entry_price:.2f} | Shares: {shares} | SL: Rs {hard_sl:.2f} | TP1: Rs {tp1:.2f} | Setup: {strategy_name}")
@@ -317,12 +317,17 @@ class CloudChampionEngine:
                     
         self.manage_active_positions(snapshots, time_str)
         
-        if time_str >= "09:25" and not self.scan_0925_done and len(self.active_positions) < self.max_slots:
+        # Strict 5-minute execution windows (avoids executing late if server boots outside window)
+        if "09:25" <= time_str <= "09:30" and not self.scan_0925_done and len(self.active_positions) < self.max_slots:
             self.evaluate_scan_0925(snapshots)
             self.scan_0925_done = True
+        elif time_str > "09:30" and not self.scan_0925_done:
+            self.scan_0925_done = True
             
-        if time_str >= "10:15" and not self.scan_1015_done and len(self.active_positions) < self.max_slots:
+        if "10:15" <= time_str <= "10:20" and not self.scan_1015_done and len(self.active_positions) < self.max_slots:
             self.evaluate_scan_1015(snapshots)
+            self.scan_1015_done = True
+        elif time_str > "10:20" and not self.scan_1015_done:
             self.scan_1015_done = True
             
         if time_str >= "15:20" and not self.eod_done:
@@ -402,13 +407,17 @@ class CloudChampionEngine:
             pos['pnl_inr'] = round(pos['exposure'] * (pnl_pct / 100.0), 2)
             if pnl_pct > pos['mfe_pct']: pos['mfe_pct'] = pnl_pct
             
+            # 1. Check Hard SL / Trailed Stop
             if pos['direction'] == 'SHORT' and curr_px >= pos['current_sl']:
-                self.exit_position(pos, pos['current_sl'], 'Hard Stop-Loss Hit (1.40%)', time_str)
+                reason = 'Hard Stop-Loss Hit' if not pos['tp1_hit'] else 'Trailing Stop Hit (+1.40% locked)'
+                self.exit_position(pos, pos['current_sl'], reason, time_str)
                 continue
             elif pos['direction'] == 'LONG' and curr_px <= pos['current_sl']:
-                self.exit_position(pos, pos['current_sl'], 'Hard Stop-Loss Hit (1.40%)', time_str)
+                reason = 'Hard Stop-Loss Hit' if not pos['tp1_hit'] else 'Trailing Stop Hit (+1.40% locked)'
+                self.exit_position(pos, pos['current_sl'], reason, time_str)
                 continue
                 
+            # 2. Check TP1 Hit (+1.95%) -> Trail stop to lock +1.40% profit
             if not pos['tp1_hit']:
                 if (pos['direction'] == 'SHORT' and curr_px <= pos['tp1']) or (pos['direction'] == 'LONG' and curr_px >= pos['tp1']):
                     pos['tp1_hit'] = True
@@ -416,29 +425,27 @@ class CloudChampionEngine:
                     pos['current_sl'] = round(new_sl, 2)
                     logger.info(f"[TARGET 1 HIT] {pos['symbol']} reached +1.95%! SL trailed to lock +1.40% @ Rs {new_sl:.2f}")
                     
+            # 3. Check TP2 Hit (+3.40%)
             if (pos['direction'] == 'SHORT' and curr_px <= pos['tp2']) or (pos['direction'] == 'LONG' and curr_px >= pos['tp2']):
                 self.exit_position(pos, pos['tp2'], 'Target 2 Profit Reached (+3.40%)', time_str)
                 continue
                 
+            # 4. Extended Dynamic Trailing after +1.50% MFE (pure 5-year model)
+            if pos['tp1_hit'] and pos['mfe_pct'] >= 1.50:
+                sgn = -1.0 if pos['direction'] == 'SHORT' else 1.0
+                dyn_px = round(pos['entry_price'] * (1.0 + sgn * (pos['mfe_pct'] - 0.35) / 100.0), 2)
+                if pos['direction'] == 'SHORT' and dyn_px < pos['current_sl']:
+                    pos['current_sl'] = dyn_px
+                elif pos['direction'] == 'LONG' and dyn_px > pos['current_sl']:
+                    pos['current_sl'] = dyn_px
+
+            # 5. Afternoon Anti-Scratch Ratchet at 13:30 (lock +0.60% if MFE >= +0.70%)
             if time_str >= "13:30" and not pos['ratchet_locked'] and pos['mfe_pct'] >= 0.70:
                 pos['ratchet_locked'] = True
                 lock_px = pos['entry_price'] * (1.0 - 0.0060) if pos['direction'] == 'SHORT' else pos['entry_price'] * (1.0 + 0.0060)
                 if pos['direction'] == 'SHORT' and lock_px < pos['current_sl']: pos['current_sl'] = round(lock_px, 2)
                 elif pos['direction'] == 'LONG' and lock_px > pos['current_sl']: pos['current_sl'] = round(lock_px, 2)
                 logger.info(f"[AFTERNOON RATCHET] {pos['symbol']} locked +0.60% profit @ Rs {pos['current_sl']:.2f}")
-                
-            if pos['direction'] == 'SHORT' and curr_px > vwap:
-                pos['consecutive_vwap_violations'] += 1
-                if pos['consecutive_vwap_violations'] >= 2:
-                    self.exit_position(pos, curr_px, 'Defense Rule #1: VWAP Invalidation Cut', time_str)
-                    continue
-            elif pos['direction'] == 'LONG' and curr_px < vwap:
-                pos['consecutive_vwap_violations'] += 1
-                if pos['consecutive_vwap_violations'] >= 2:
-                    self.exit_position(pos, curr_px, 'Defense Rule #1: VWAP Invalidation Cut', time_str)
-                    continue
-            else:
-                pos['consecutive_vwap_violations'] = 0
                 
             remaining.append(pos)
         self.active_positions = remaining
