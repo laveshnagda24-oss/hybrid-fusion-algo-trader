@@ -338,26 +338,20 @@ class CloudChampionEngine:
             self.eod_done = True
 
     def evaluate_scan_0925(self, snapshots):
+        """Pure 5-Year Model: 09:25 AM is LONG ONLY on extreme panic market drops. ZERO 09:25 Shorts."""
         if len(self.active_positions) >= self.max_slots or not snapshots: return
         mkt_bear = sum(1 for s in snapshots.values() if s['close'] < s['open_0915'] and s['close'] < s['vwap'])
-        mkt_bull = sum(1 for s in snapshots.values() if s['close'] > s['open_0915'] and s['close'] > s['vwap'])
         total = len(snapshots)
         if total == 0: return
         bear_breadth = (mkt_bear / total) * 100.0
-        bull_breadth = (mkt_bull / total) * 100.0
         
+        # Only trigger on extreme market panic open (Specialist #1: Panic Dip Bounce LONG)
         if bear_breadth >= 60.0:
             cands = [(sym, s) for sym, s in snapshots.items() if -3.50 <= s['ret_open'] <= -0.30]
             cands.sort(key=lambda x: x[1]['ret_open'])
             for sym, snap in cands:
                 if len(self.active_positions) >= self.max_slots: break
-                self.enter_position(sym, 'LONG', snap['close'], snap['vwap'], '09:25', 'Tier #1 Panic Bounce LONG')
-        elif bull_breadth >= 60.0:
-            cands = [(sym, s) for sym, s in snapshots.items() if 0.40 <= s['ret_open'] <= 3.50]
-            cands.sort(key=lambda x: x[1]['ret_open'], reverse=True)
-            for sym, snap in cands:
-                if len(self.active_positions) >= self.max_slots: break
-                self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '09:25', 'Tier #2 Euphoria Fade SHORT')
+                self.enter_position(sym, 'LONG', snap['close'], snap['vwap'], '09:25', 'Specialist #1: Panic Dip Bounce LONG')
 
     def evaluate_scan_1015(self, snapshots):
         if len(self.active_positions) >= self.max_slots or not snapshots: return
@@ -459,7 +453,64 @@ class CloudChampionEngine:
 
     def run_daily_postmarket_screener(self):
         logger.info("Executing daily post-market screener to prepare candidates for next trading day...")
-        self.load_candidates()
+        try:
+            n500_path = os.path.join(DATA_DIR, 'ind_nifty500list.csv')
+            if not os.path.exists(n500_path):
+                logger.warning("Nifty 500 list not found for screener.")
+                return
+            df_n500 = pd.read_csv(n500_path)
+            now = datetime.datetime.now(IST)
+            today_str = now.strftime("%Y-%m-%d")
+            
+            cands = []
+            for _, r in df_n500.iterrows():
+                sym = r.get('Symbol')
+                isin = r.get('ISIN Code')
+                sec = r.get('Industry', 'N/A')
+                if not isin: continue
+                
+                url = f"https://api.upstox.com/v2/historical-candle/NSE_EQ%7C{isin}/day/{today_str}/2026-10-01"
+                req = urllib.request.Request(url, headers=HEADERS)
+                try:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        data = json.loads(resp.read().decode('utf-8'))
+                        candles = sorted(data.get('data', {}).get('candles', []), key=lambda x: x[0])
+                        if len(candles) >= 6:
+                            last_c = float(candles[-1][4])
+                            c_5ago = float(candles[-6][4])
+                            if not (100.0 <= last_c <= 4500.0): continue
+                            ret_5d = ((last_c - c_5ago) / c_5ago) * 100.0
+                            if ret_5d >= 5.0:
+                                if len(candles) >= 11:
+                                    trs = []
+                                    for i in range(len(candles)-10, len(candles)):
+                                        h = float(candles[i][2])
+                                        l = float(candles[i][3])
+                                        prev_cl = float(candles[i-1][4])
+                                        trs.append(max(h - l, abs(h - prev_cl), abs(l - prev_cl)))
+                                    atr10_pct = (np.mean(trs) / last_c) * 100.0
+                                else:
+                                    atr10_pct = 2.0
+                                cands.append({
+                                    'symbol': sym,
+                                    'isin': isin,
+                                    'sector': sec,
+                                    'prev_close': round(last_c, 2),
+                                    'ret_5d': round(ret_5d, 2),
+                                    'atr10_pct': round(atr10_pct, 2)
+                                })
+                except Exception:
+                    continue
+                    
+            if cands:
+                cands.sort(key=lambda x: x['ret_5d'], reverse=True)
+                json_path = os.path.join(DATA_DIR, 'premarket_candidates_latest.json')
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump({'date': today_str, 'count': len(cands), 'candidates': cands}, f, indent=2)
+                self.candidates = cands
+                logger.info(f"Daily post-market screener completed! Saved {len(cands)} candidates for next session.")
+        except Exception as e:
+            logger.error(f"Post-market screener error: {e}")
 
 engine = CloudChampionEngine(capital_mode="30k", dry_run=True)
 
