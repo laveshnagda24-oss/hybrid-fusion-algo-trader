@@ -21,6 +21,7 @@ import numpy as np
 import pytz
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import uvicorn
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
@@ -90,6 +91,13 @@ def query_turso_raw(sql, params=None):
 
 def save_trade_to_turso(pos, exit_px, exit_reason, exit_time, net_inr, net_pct, ending_capital):
     today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+    # Idempotency check: prevent duplicate inserts if multiple workers or threads run
+    check_sql = "SELECT id FROM champion_cloud_paper_trades WHERE trade_date = ? AND symbol = ? AND entry_time = ? AND exit_time = ? LIMIT 1"
+    df_exists = query_turso_raw(check_sql, [today_str, pos['symbol'], pos['entry_time'], exit_time])
+    if not df_exists.empty:
+        logger.info(f"Trade {pos['symbol']} already recorded in Turso for {today_str}. Skipping duplicate.")
+        return
+
     sql = """
     INSERT INTO champion_cloud_paper_trades 
     (trade_date, symbol, direction, sector, entry_time, exit_time, entry_price, exit_price, shares, exposure_inr, pnl_net_inr, pnl_net_pct, exit_reason, strategy, ending_capital)
@@ -159,14 +167,20 @@ class CloudChampionEngine:
 
     def load_candidates(self):
         json_path = os.path.join(DATA_DIR, 'premarket_candidates_latest.json')
+        loaded = False
         if os.path.exists(json_path):
             try:
                 with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.candidates = data.get('candidates', [])
-                logger.info(f"Loaded {len(self.candidates)} screened candidates for trading.")
+                if len(self.candidates) > 0:
+                    loaded = True
+                    logger.info(f"Loaded {len(self.candidates)} screened candidates for trading.")
             except Exception as e:
                 logger.error(f"Error loading candidates: {e}")
+        if not loaded or len(self.candidates) == 0:
+            logger.info("Watchlist empty or missing. Launching immediate parallel screener...")
+            self.run_daily_postmarket_screener()
 
     def fetch_live_1min_bars(self, isin):
         url = f"https://api.upstox.com/v2/historical-candle/intraday/NSE_EQ%7C{isin}/1minute"
@@ -405,29 +419,22 @@ class CloudChampionEngine:
         tier_3a.sort(key=lambda x: x[1]['ret_5d'], reverse=True)
         tier_3b.sort(key=lambda x: x[1]['ret_5d'], reverse=True)
         
-        # Priority 1: Unanimous Conviction (60% of all 5-year profit!)
-        used_secs = {p['sector'] for p in self.active_positions}
-        for sym, pm, snap, strat_name in unanimous:
+        # Multi-Pass Selection: Pass 1 enforces 1 stock per sector. Pass 2 allows 2 if slots remain open.
+        candidates_ordered = unanimous + tier_3a + tier_3b
+        for max_sec in (1, 2):
             if len(self.active_positions) >= self.max_slots: break
-            if pm.get('sector') in used_secs: continue
-            used_secs.add(pm.get('sector'))
-            self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', strat_name, sector=pm.get('sector', 'N/A'))
+            sec_counts = {}
+            for p in self.active_positions:
+                sec = p.get('sector', 'N/A')
+                sec_counts[sec] = sec_counts.get(sec, 0) + 1
             
-        # Priority 2: High Conviction Tier 3A
-        if len(self.active_positions) < self.max_slots:
-            for sym, pm, snap, strat_name in tier_3a:
+            for sym, pm, snap, strat_name in candidates_ordered:
                 if len(self.active_positions) >= self.max_slots: break
-                if pm.get('sector') in used_secs: continue
-                used_secs.add(pm.get('sector'))
-                self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', strat_name, sector=pm.get('sector', 'N/A'))
-                
-        # Priority 3: Fallback Tier 3B
-        if len(self.active_positions) < self.max_slots:
-            for sym, pm, snap, strat_name in tier_3b:
-                if len(self.active_positions) >= self.max_slots: break
-                if pm.get('sector') in used_secs: continue
-                used_secs.add(pm.get('sector'))
-                self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', strat_name, sector=pm.get('sector', 'N/A'))
+                if any(p['symbol'] == sym for p in self.active_positions): continue
+                sec = pm.get('sector', 'N/A')
+                if sec_counts.get(sec, 0) >= max_sec: continue
+                sec_counts[sec] = sec_counts.get(sec, 0) + 1
+                self.enter_position(sym, 'SHORT', snap['close'], snap['vwap'], '10:15', strat_name, sector=sec)
 
     def manage_active_positions(self, snapshots, time_str):
         """2-Tranche Partial Exit Execution (Leg 1 50% @ TP1, Leg 2 50% Trailed / TP2)."""
@@ -513,7 +520,7 @@ class CloudChampionEngine:
         self.active_positions.clear()
 
     def run_daily_postmarket_screener(self):
-        logger.info("Executing daily post-market screener to prepare candidates for next trading day...")
+        logger.info("Executing daily parallel screener across Nifty 500 universe...")
         try:
             n500_path = os.path.join(DATA_DIR, 'ind_nifty500list.csv')
             if not os.path.exists(n500_path):
@@ -523,25 +530,23 @@ class CloudChampionEngine:
             now = datetime.datetime.now(IST)
             today_str = now.strftime("%Y-%m-%d")
             
+            valid_stocks = df_n500.dropna(subset=['ISIN Code', 'Symbol']).copy()
             cands = []
-            for _, r in df_n500.iterrows():
-                sym = r.get('Symbol')
-                isin = r.get('ISIN Code')
-                sec = r.get('Industry', 'N/A')
-                if not isin: continue
-                
+
+            def fetch_single(sym, isin, sec):
                 url = f"https://api.upstox.com/v2/historical-candle/NSE_EQ%7C{isin}/day/{today_str}/2026-10-01"
                 req = urllib.request.Request(url, headers=HEADERS)
                 try:
-                    with urllib.request.urlopen(req, timeout=3) as resp:
+                    with urllib.request.urlopen(req, timeout=4) as resp:
                         data = json.loads(resp.read().decode('utf-8'))
                         candles = sorted(data.get('data', {}).get('candles', []), key=lambda x: x[0])
                         if len(candles) >= 6:
                             last_c = float(candles[-1][4])
                             c_5ago = float(candles[-6][4])
-                            if not (100.0 <= last_c <= 4500.0): continue
+                            if not (100.0 <= last_c <= 4500.0):
+                                return None
                             ret_5d = ((last_c - c_5ago) / c_5ago) * 100.0
-                            if ret_5d >= 5.0:
+                            if ret_5d >= 3.50:
                                 if len(candles) >= 11:
                                     trs = []
                                     for i in range(len(candles)-10, len(candles)):
@@ -552,16 +557,24 @@ class CloudChampionEngine:
                                     atr10_pct = (np.mean(trs) / last_c) * 100.0
                                 else:
                                     atr10_pct = 2.0
-                                cands.append({
+                                return {
                                     'symbol': sym,
                                     'isin': isin,
                                     'sector': sec,
                                     'prev_close': round(last_c, 2),
                                     'ret_5d': round(ret_5d, 2),
                                     'atr10_pct': round(atr10_pct, 2)
-                                })
+                                }
                 except Exception:
-                    continue
+                    pass
+                return None
+
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futs = [executor.submit(fetch_single, r['Symbol'], r['ISIN Code'], r.get('Industry', 'N/A')) for _, r in valid_stocks.iterrows()]
+                for f in as_completed(futs):
+                    res = f.result()
+                    if res:
+                        cands.append(res)
                     
             if cands:
                 cands.sort(key=lambda x: x['ret_5d'], reverse=True)
@@ -569,7 +582,7 @@ class CloudChampionEngine:
                 with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump({'date': today_str, 'count': len(cands), 'candidates': cands}, f, indent=2)
                 self.candidates = cands
-                logger.info(f"Daily post-market screener completed! Saved {len(cands)} candidates for next session.")
+                logger.info(f"Daily screener completed! Filtered {len(cands)} quality candidates for next session.")
         except Exception as e:
             logger.error(f"Post-market screener error: {e}")
 
