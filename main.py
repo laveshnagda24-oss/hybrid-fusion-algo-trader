@@ -329,7 +329,8 @@ class CloudChampionEngine:
             
         if time_str < "09:15" or time_str > "15:30":
             self.status = f"STANDBY (Market Closed) - Next: 09:15 AM Open"
-            if time_str >= "15:35" and not self.screener_done:
+            # Screener triggers: Evening at 18:00 IST (once NSE finalizes EOD bars) OR Morning at 08:30 IST
+            if (time_str >= "18:00" or ("08:30" <= time_str < "09:10")) and not self.screener_done:
                 self.run_daily_postmarket_screener()
                 self.screener_done = True
             return
