@@ -231,7 +231,7 @@ class CloudChampionEngine:
         sl_pct = 0.0120 if entry_time == '09:25' else 0.0140
         hard_sl = entry_price * (1.0 + sl_pct) if direction == 'SHORT' else entry_price * (1.0 - sl_pct)
         tp1 = entry_price * (1.0 - 0.0195) if direction == 'SHORT' else entry_price * (1.0 + 0.0195)
-        tp2 = entry_price * (1.0 - 0.0340) if direction == 'SHORT' else entry_price * (1.0 + 0.0340)
+        tp2 = entry_price * (1.0 - 0.0280) if direction == 'SHORT' else entry_price * (1.0 + 0.0280)
         
         pos = {
             'symbol': sym,
@@ -256,6 +256,7 @@ class CloudChampionEngine:
             'ratchet_locked': False,
             'strategy': strategy_name,
             'mfe_pct': 0.0,
+            'mae_pct': 0.0,
             'vwap': vwap,
             'pnl_inr': 0.0,
             'pnl_pct': 0.0
@@ -454,10 +455,20 @@ class CloudChampionEngine:
             
             mult = 1.0 if pos['direction'] == 'LONG' else -1.0
             pnl_pct = ((curr_px - pos['entry_price']) / pos['entry_price']) * 100.0 * mult
+            adverse_pct = ((pos['entry_price'] - curr_px) / pos['entry_price']) * 100.0 * mult # Adverse move
             pos['pnl_pct'] = round(pnl_pct, 2)
             pos['pnl_inr'] = round(pos['exposure'] * (pnl_pct / 100.0), 2)
             if pnl_pct > pos['mfe_pct']: pos['mfe_pct'] = pnl_pct
+            if adverse_pct > pos.get('mae_pct', 0.0): pos['mae_pct'] = adverse_pct
             
+            # 0. Check Early Momentum-Deficit Loss Cut (-0.80% early cut if no breakdown momentum)
+            # If adverse move >= 0.80% and trade never achieved >= +0.45% MFE, cut loss early!
+            if not pos['l1_closed'] and pos.get('mae_pct', 0.0) >= 0.80 and pos['mfe_pct'] < 0.45:
+                early_cut_px = pos['entry_price'] * (1.0 + 0.0080) if pos['direction'] == 'SHORT' else pos['entry_price'] * (1.0 - 0.0080)
+                logger.info(f"[EARLY LOSS CUT] {pos['symbol']} adverse move {pos['mae_pct']:.2f}% >= 0.80% with MFE {pos['mfe_pct']:.2f}% < 0.45%! Cutting loss early @ Rs {early_cut_px:.2f} (saves ~0.60% / Rs 450 loss).")
+                self.exit_position(pos, early_cut_px, 'Early Momentum-Deficit Cut (-0.80%)', time_str, exit_leg="FULL")
+                continue
+
             # 1. Check Hard SL / Trailed Stop Hit
             if (pos['direction'] == 'SHORT' and curr_px >= pos['current_sl']) or (pos['direction'] == 'LONG' and curr_px <= pos['current_sl']):
                 if pos['l1_closed']:
@@ -487,9 +498,9 @@ class CloudChampionEngine:
                     pos['exposure'] = round(pos['shares_l2'] * pos['entry_price'], 2)
                     logger.info(f"[2-TRANCHE TP1] {pos['symbol']} booked 50% @ TP1 (+1.95%)! Runner leg trailed to lock +1.40% @ Rs {new_sl:.2f}")
                     
-            # 3. Check TP2 Hit (+3.40%) on Leg 2
+            # 3. Check TP2 Hit (+2.80%) on Leg 2
             if (pos['direction'] == 'SHORT' and curr_px <= pos['tp2']) or (pos['direction'] == 'LONG' and curr_px >= pos['tp2']):
-                self.exit_position(pos, pos['tp2'], 'Target 2 Profit Reached (+3.40%)', time_str, exit_leg="LEG_2" if pos['l1_closed'] else "FULL")
+                self.exit_position(pos, pos['tp2'], 'Target 2 Profit Reached (+2.80%)', time_str, exit_leg="LEG_2" if pos['l1_closed'] else "FULL")
                 continue
                 
             # 4. Extended Dynamic Trailing after +1.50% MFE on runner leg
