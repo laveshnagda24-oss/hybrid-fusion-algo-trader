@@ -245,7 +245,7 @@ class CloudChampionEngine:
 
     def recalc_slots(self):
         self.slot_exposure = (self.account_capital * 5.0) / 2.0
-        self.ratchet_locked_net = round(self.slot_exposure * 0.0060 * 0.80, 2)
+        self.ratchet_locked_net = round(self.slot_exposure * 0.0080 * 0.80, 2)
 
     def load_candidates(self):
         json_path = os.path.join(DATA_DIR, 'premarket_candidates_latest.json')
@@ -357,28 +357,12 @@ class CloudChampionEngine:
         shares_l1 = shares // 2
         shares_l2 = shares - shares_l1
         
-        # Configure bracket dynamically based on RL chosen action
-        if rl_action == 1:
-            # Action 1: Conservative Scalp / Defensive Ratchet
-            action_tag = "RL_SCALP_LOCK"
-            sl_pct = 0.0100
-            tp1_pct = 0.0140
-            tp2_pct = 0.0140
-            early_cut_pct = 0.0070
-        elif rl_action == 3:
-            # Action 3: Aggressive Trend Runner Bracket
-            action_tag = "RL_TREND_RUNNER"
-            sl_pct = 0.0150
-            tp1_pct = 0.0220
-            tp2_pct = 0.0350
-            early_cut_pct = 0.0090
-        else:
-            # Action 2: Balanced Multi-Tranche Bracket (Phase 2 Standard)
-            action_tag = "RL_BALANCED"
-            sl_pct = 0.0140
-            tp1_pct = 0.0195
-            tp2_pct = 0.0280
-            early_cut_pct = 0.0080
+        # Strategy 2: Calibrated High-Payoff Champion Brackets
+        action_tag = "STRATEGY_2_CALIBRATED"
+        sl_pct = 0.0140
+        tp1_pct = 0.0190
+        tp2_pct = 0.0300
+        early_cut_pct = 0.0080
             
         hard_sl = entry_price * (1.0 + sl_pct) if direction == 'SHORT' else entry_price * (1.0 - sl_pct)
         tp1 = entry_price * (1.0 - tp1_pct) if direction == 'SHORT' else entry_price * (1.0 + tp1_pct)
@@ -678,13 +662,13 @@ class CloudChampionEngine:
                     
                     self.exit_position(pos, pos['tp1'], 'Target 1 Hit', time_str, exit_leg="LEG_1")
                     
-                    # Trail stop to lock profit
-                    lock_pct = 0.0140 if pos.get('rl_action') != 1 else 0.0060
+                    # Strategy 2: Trail Leg 2 stop to lock +0.95% profit
+                    lock_pct = 0.0095
                     new_sl = pos['entry_price'] * (1.0 - lock_pct) if pos['direction'] == 'SHORT' else pos['entry_price'] * (1.0 + lock_pct)
                     pos['current_sl'] = round(new_sl, 2)
                     pos['shares'] = pos['shares_l2']
                     pos['exposure'] = round(pos['shares_l2'] * pos['entry_price'], 2)
-                    logger.info(f"[TP1 BOOKED] {pos['symbol']} booked 50% @ TP1! Runner trailed @ Rs {new_sl:.2f}")
+                    logger.info(f"[TP1 BOOKED] {pos['symbol']} booked 50% @ TP1 (+1.90%)! Runner trailed @ Rs {new_sl:.2f} (+0.95% locked)")
                     
             # 3. TP2 Hit
             if (pos['direction'] == 'SHORT' and curr_px <= pos['tp2']) or (pos['direction'] == 'LONG' and curr_px >= pos['tp2']):
@@ -700,13 +684,13 @@ class CloudChampionEngine:
                 elif pos['direction'] == 'LONG' and dyn_px > pos['current_sl']:
                     pos['current_sl'] = dyn_px
 
-            # 5. Afternoon Anti-Scratch Ratchet (at 13:30)
-            if time_str >= "13:30" and not pos['ratchet_locked'] and pos['mfe_pct'] >= 0.70:
+            # 5. Afternoon Anti-Scratch Ratchet (at 13:30, locks +0.80% if MFE >= 1.00%)
+            if time_str >= "13:30" and not pos['ratchet_locked'] and pos['mfe_pct'] >= 1.00:
                 pos['ratchet_locked'] = True
-                lock_px = pos['entry_price'] * (1.0 - 0.0060) if pos['direction'] == 'SHORT' else pos['entry_price'] * (1.0 + 0.0060)
+                lock_px = pos['entry_price'] * (1.0 - 0.0080) if pos['direction'] == 'SHORT' else pos['entry_price'] * (1.0 + 0.0080)
                 if pos['direction'] == 'SHORT' and lock_px < pos['current_sl']: pos['current_sl'] = round(lock_px, 2)
                 elif pos['direction'] == 'LONG' and lock_px > pos['current_sl']: pos['current_sl'] = round(lock_px, 2)
-                logger.info(f"[AFTERNOON RATCHET] {pos['symbol']} locked +0.60% profit @ Rs {pos['current_sl']:.2f}")
+                logger.info(f"[AFTERNOON RATCHET] {pos['symbol']} locked +0.80% profit @ Rs {pos['current_sl']:.2f}")
                 
             remaining.append(pos)
         self.active_positions = remaining
