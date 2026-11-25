@@ -669,6 +669,8 @@ class F12CausalEngine:
             "split": b["split"],
             "ratchet_pct": b["ratchet"],
             "entry_time": entry_time_str,
+            "entry_bar_idx": 30 if entry_time_str == "09:45" else 60,
+            "last_managed_idx": -1,
             "raw_ep": raw_ep,
             "entry_px": entry_px,
             "qty": qty,
@@ -890,30 +892,56 @@ class F12CausalEngine:
         open_cnt = sum(1 for v in self.active_positions.values() if v is not None)
         self.status = f"RUNNING LIVE ({time_str} IST) | Mode: F12_CAUSAL_5xVol (2 Slots) | Open: {open_cnt}/2"
 
-        if "09:45" <= time_str < "09:50" and not self.scan_0945_done:
+        if time_str >= "09:45" and not self.scan_0945_done:
             self.scan_market_0945()
-        elif time_str >= "09:50" and not self.scan_0945_done:
-            self.scan_0945_done = True
 
-        if "10:15" <= time_str < "10:20" and not self.scan_1015_done:
+        if time_str >= "10:15" and not self.scan_1015_done:
             self.scan_market_1015()
-        elif time_str >= "10:20" and not self.scan_1015_done:
-            self.scan_1015_done = True
 
         for slot_id in ("A", "B"):
             pos = self.active_positions.get(slot_id)
             if pos:
                 bars_1m = self.fetch_live_1min_bars(pos["isin"])
-                if time_str >= "15:20" and not self.eod_done:
-                    self.eod_square_off(slot_id, bars_1m, time_str)
-                else:
-                    self.manage_slot_position(slot_id, bars_1m, time_str)
+                self.catch_up_slot_bars(slot_id, bars_1m, time_str)
 
         if time_str >= "15:20" and not self.eod_done:
             self.eod_done = True
             wins = sum(1 for t in self.closed_trades if t["net_inr"] > 0)
             losses = sum(1 for t in self.closed_trades if t["net_inr"] <= 0)
             save_eod_balance_to_turso(today_str, self.capital_base, self.today_pnl, self.cumulative_capital, len(self.closed_trades), wins, losses)
+
+    def catch_up_slot_bars(self, slot_id, bars_1m, current_time_str):
+        pos = self.active_positions.get(slot_id)
+        if not pos or not bars_1m:
+            return
+        start_idx = max(pos.get("entry_bar_idx", 0), pos.get("last_managed_idx", -1) + 1)
+        max_idx = min(len(bars_1m), 366)
+        for b_idx in range(start_idx, max_idx):
+            pos = self.active_positions.get(slot_id)
+            if not pos:
+                break
+            ts_raw = str(bars_1m[b_idx][0])
+            bar_hhmm = ts_raw[11:16] if len(ts_raw) >= 16 and "T" in ts_raw else current_time_str
+            if b_idx >= 365:
+                self.eod_square_off(slot_id, bars_1m[: b_idx + 1], bar_hhmm or "15:20")
+                break
+            self.manage_slot_position(slot_id, bars_1m[: b_idx + 1], bar_hhmm)
+            if self.active_positions.get(slot_id) is not None:
+                self.active_positions[slot_id]["last_managed_idx"] = b_idx
+
+    def run_catchup_today(self):
+        """Catch up all available intraday bars for today (even after 15:30 market close)."""
+        now = datetime.datetime.now(IST)
+        time_str = now.strftime("%H:%M")
+        if not self.scan_0945_done:
+            self.scan_market_0945()
+        if not self.scan_1015_done:
+            self.scan_market_1015()
+        for slot_id in ("A", "B"):
+            pos = self.active_positions.get(slot_id)
+            if pos:
+                bars_1m = self.fetch_live_1min_bars(pos["isin"])
+                self.catch_up_slot_bars(slot_id, bars_1m, time_str)
 
 
 Champion1UnionEngine = F12CausalEngine
