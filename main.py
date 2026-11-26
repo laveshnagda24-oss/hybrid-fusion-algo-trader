@@ -325,29 +325,38 @@ class F12CausalEngine:
         if len(bars_1m) < n_bars + 1 or len(daily_bars) < 11:
             return None
 
-        prev_close = float(daily_bars[-2][4])
+        today_iso = str(bars_1m[0][0])[:10]
+        if len(today_iso) == 10 and "-" in today_iso:
+            completed_daily = [d for d in daily_bars if str(d[0])[:10] < today_iso]
+        else:
+            completed_daily = daily_bars[:-1]
+
+        if len(completed_daily) < 11:
+            return None
+
+        prev_close = float(completed_daily[-1][4])
         if prev_close < 50.0:
             return None
 
         c2c_moves = [
-            abs(float(daily_bars[i][4]) / float(daily_bars[i - 1][4]) - 1.0) * 100.0
-            for i in range(len(daily_bars) - 10, len(daily_bars))
-            if float(daily_bars[i - 1][4]) > 0
+            abs(float(completed_daily[i][4]) / float(completed_daily[i - 1][4]) - 1.0) * 100.0
+            for i in range(len(completed_daily) - 10, len(completed_daily))
+            if float(completed_daily[i - 1][4]) > 0
         ]
         if any(m > 25.0 for m in c2c_moves):
             return None
 
         trs = []
-        for i in range(len(daily_bars) - 11, len(daily_bars) - 1):
-            h_d = float(daily_bars[i][2])
-            l_d = float(daily_bars[i][3])
-            pc_d = float(daily_bars[i - 1][4])
+        for i in range(len(completed_daily) - 10, len(completed_daily)):
+            h_d = float(completed_daily[i][2])
+            l_d = float(completed_daily[i][3])
+            pc_d = float(completed_daily[i - 1][4])
             trs.append(max(h_d - l_d, abs(h_d - pc_d), abs(l_d - pc_d)))
         atr10 = (float(np.mean(trs)) / prev_close) * 100.0
 
-        prev1d_ret = (float(daily_bars[-2][4]) / float(daily_bars[-3][4]) - 1.0) * 100.0
+        prev1d_ret = (float(completed_daily[-1][4]) / float(completed_daily[-2][4]) - 1.0) * 100.0
         prev5d_ret = float(
-            sum((float(daily_bars[i][4]) / float(daily_bars[i - 1][4]) - 1.0) * 100.0 for i in range(len(daily_bars) - 6, len(daily_bars) - 1))
+            sum((float(completed_daily[i][4]) / float(completed_daily[i - 1][4]) - 1.0) * 100.0 for i in range(len(completed_daily) - 5, len(completed_daily)))
         )
 
         win_bars = bars_1m[:n_bars]
