@@ -49,6 +49,9 @@ HEADERS = {
 
 SLIPPAGE = 0.0005  # 0.05% adverse slippage on entry and exit
 MIN_VOL_MULT = 5.0 # Strict liquidity guard: entry 1m bar volume >= 5.0 * qty
+_UPSTOX_LOCK = threading.Lock()
+_UPSTOX_LAST_REQ = 0.0
+_UPSTOX_MIN_INTERVAL = 0.15  # ~6.5 req/sec max to prevent HTTP 429 rate limits
 
 BRACKETS = {
     "S_SL1.80_TP3.0_4.8_R0.2": {"direction": "SHORT", "split": True,  "sl": 1.80, "tp1": 3.00, "tp2": 4.80, "ratchet": 0.20},
@@ -216,6 +219,8 @@ class F12CausalEngine:
         self.eod_done = False
 
         self._5d_vol_cache = {}  # (isin, n_bars) -> mean 5d window volume
+        self._intraday_cache = {}
+        self._daily_cache = {}
 
         self.init_capital_from_db()
         self.load_watchlist()
@@ -242,31 +247,53 @@ class F12CausalEngine:
             except Exception as e:
                 logger.error(f"Error loading universe: {e}")
 
-    def fetch_live_1min_bars(self, isin):
-        url = f"https://api.upstox.com/v2/historical-candle/intraday/NSE_EQ%7C{isin}/1minute"
-        req = urllib.request.Request(url, headers=HEADERS)
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                candles = data.get("data", {}).get("candles", [])
-                if candles:
-                    return sorted(candles, key=lambda x: x[0])
-        except Exception:
-            pass
+    def _fetch_upstox_candles(self, url, timeout=8, retries=3):
+        global _UPSTOX_LAST_REQ
+        for attempt in range(retries + 1):
+            with _UPSTOX_LOCK:
+                wait = _UPSTOX_MIN_INTERVAL - (time.time() - _UPSTOX_LAST_REQ)
+                if wait > 0:
+                    time.sleep(wait)
+                _UPSTOX_LAST_REQ = time.time()
+            req = urllib.request.Request(url, headers=HEADERS)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    candles = data.get("data", {}).get("candles", [])
+                    return sorted(candles, key=lambda x: x[0]) if candles else []
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < retries:
+                    time.sleep(1.0 * (2 ** attempt))
+                    continue
+                return []
+            except Exception:
+                if attempt < retries:
+                    time.sleep(0.3)
+                    continue
+                return []
         return []
 
+    def fetch_live_1min_bars(self, isin):
+        url = f"https://api.upstox.com/v2/historical-candle/intraday/NSE_EQ%7C{isin}/1minute"
+        candles = self._fetch_upstox_candles(url)
+        if not candles:
+            today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+            hist_url = f"https://api.upstox.com/v2/historical-candle/NSE_EQ%7C{isin}/1minute/{today_str}/{today_str}"
+            candles = self._fetch_upstox_candles(hist_url)
+        if candles:
+            self._intraday_cache[isin] = candles
+            return candles
+        return self._intraday_cache.get(isin, [])
+
     def fetch_daily_bars(self, isin, today_str):
+        if (isin, today_str) in self._daily_cache:
+            return self._daily_cache[(isin, today_str)]
         start_dt = (datetime.datetime.strptime(today_str, "%Y-%m-%d") - datetime.timedelta(days=45)).strftime("%Y-%m-%d")
         url = f"https://api.upstox.com/v2/historical-candle/NSE_EQ%7C{isin}/day/{today_str}/{start_dt}"
-        req = urllib.request.Request(url, headers=HEADERS)
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                candles = sorted(data.get("data", {}).get("candles", []), key=lambda x: x[0])
-                return candles
-        except Exception:
-            pass
-        return []
+        candles = self._fetch_upstox_candles(url)
+        if candles:
+            self._daily_cache[(isin, today_str)] = candles
+        return candles
 
     def fetch_5d_avg_window_vol(self, isin, today_str, n_bars):
         key = (isin, n_bars)
@@ -275,24 +302,18 @@ class F12CausalEngine:
         end_dt = (datetime.datetime.strptime(today_str, "%Y-%m-%d") - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         start_dt = (datetime.datetime.strptime(today_str, "%Y-%m-%d") - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
         url = f"https://api.upstox.com/v2/historical-candle/NSE_EQ%7C{isin}/1minute/{end_dt}/{start_dt}"
-        req = urllib.request.Request(url, headers=HEADERS)
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                candles = sorted(data.get("data", {}).get("candles", []), key=lambda x: x[0])
-                if candles:
-                    by_day = {}
-                    for c in candles:
-                        d_str = str(c[0])[:10]
-                        by_day.setdefault(d_str, []).append(float(c[5]))
-                    last_5 = sorted(by_day.keys())[-5:]
-                    vols = [sum(by_day[d][:n_bars]) for d in last_5 if len(by_day[d]) >= n_bars]
-                    if vols:
-                        avg_v = float(np.mean(vols))
-                        self._5d_vol_cache[key] = avg_v
-                        return avg_v
-        except Exception:
-            pass
+        candles = self._fetch_upstox_candles(url)
+        if candles:
+            by_day = {}
+            for c in candles:
+                d_str = str(c[0])[:10]
+                by_day.setdefault(d_str, []).append(float(c[5]))
+            last_5 = sorted(by_day.keys())[-5:]
+            vols = [sum(by_day[d][:n_bars]) for d in last_5 if len(by_day[d]) >= n_bars]
+            if vols:
+                avg_v = float(np.mean(vols))
+                self._5d_vol_cache[key] = avg_v
+                return avg_v
         return None
 
     def compute_window_features(self, bars_1m, daily_bars, n_bars, avg_5d_vol=None):
@@ -406,15 +427,17 @@ class F12CausalEngine:
             sig["symbol"] = sym
             sig["isin"] = isin
             sig["sector"] = sec
+            sig["cum_vol"] = sum(float(b[5]) for b in bars_1m[:n_bars])
             return sig
 
-        with ThreadPoolExecutor(max_workers=12) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futs = [executor.submit(evaluate_cand, c) for c in self.candidates]
             for f in as_completed(futs):
                 res = f.result()
                 if res:
                     raw_records.append(res)
 
+        logger.info(f"Snapshot ({n_bars}m): fetched {len(raw_records)} / {len(self.candidates)} valid stocks.")
         if not raw_records:
             return [], {}, {}
 
@@ -466,7 +489,7 @@ class F12CausalEngine:
         logger.info("=" * 80)
 
         today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        records, mkt_stats, _ = self.build_universe_snapshot(30, today_str, fetch_rel_vol=True)
+        records, mkt_stats, _ = self.build_universe_snapshot(30, today_str, fetch_rel_vol=False)
         self.scan_0945_done = True
 
         if not records:
@@ -505,12 +528,14 @@ class F12CausalEngine:
             t1_bracket = "L_SL1.80_TP3.0_4.8_R0.2"
             t1_tier = "T1_S3_LONG_R1"
         elif s3_r2:
-            t1_pick = self.pick_first_valid(
-                records,
-                lambda x: x["intra_ret"] >= 0.80 and x["dist_vwap"] >= 0.20 and x["rel_vol_5d"] >= 1.10,
-                self.slot_exposure,
-                "LONG",
-            )
+            def _s3_r2_ok(x):
+                if not (x["intra_ret"] >= 0.80 and x["dist_vwap"] >= 0.20):
+                    return False
+                avg_v = self.fetch_5d_avg_window_vol(x["isin"], today_str, 30)
+                rv = (x["cum_vol"] / avg_v) if (avg_v and avg_v > 0) else x["rel_vol_5d"]
+                return rv >= 1.10
+
+            t1_pick = self.pick_first_valid(records, _s3_r2_ok, self.slot_exposure, "LONG")
             t1_bracket = "L_SL2.00_1LEG_TP3.6"
             t1_tier = "T1_S3_LONG_R2"
 
@@ -575,26 +600,28 @@ class F12CausalEngine:
         logger.info("=" * 80)
 
         today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        records, mkt_stats, _ = self.build_universe_snapshot(60, today_str, fetch_rel_vol=True)
+        records, mkt_stats, _ = self.build_universe_snapshot(60, today_str, fetch_rel_vol=False)
         if not records:
             logger.info("10:15 Scan: No valid universe records fetched.")
             return
 
-        # Tier 4: 10:15 Bullish Reversal LONG (ranked by sec_rel_str DESC)
+        # Tier 4: 10:15 Bullish Reversal LONG (ranked by sec_rel_str DESC; lazy 5d rel_vol)
         by_sr = sorted(records, key=lambda x: (-x["sec_rel_str"], x["symbol"]))
-        rev_pick = self.pick_first_valid(
-            by_sr,
-            lambda x: (
+
+        def _t4_rev_ok(x):
+            if not (
                 x["open_gap"] <= -0.40
                 and x["dist_vwap"] >= 0.15
                 and x["clv_intra"] >= 0.20
-                and x["rel_vol_5d"] >= 1.15
                 and x["mkt_ret"] >= 0.20
                 and x["sec_ret"] >= 0.0
-            ),
-            self.slot_exposure,
-            "LONG",
-        )
+            ):
+                return False
+            avg_v = self.fetch_5d_avg_window_vol(x["isin"], today_str, 60)
+            rv = (x["cum_vol"] / avg_v) if (avg_v and avg_v > 0) else x["rel_vol_5d"]
+            return rv >= 1.15
+
+        rev_pick = self.pick_first_valid(by_sr, _t4_rev_ok, self.slot_exposure, "LONG")
 
         def pick_catch_all(scale):
             if not self.enable_1015_catch_all:
@@ -883,6 +910,8 @@ class F12CausalEngine:
             self.closed_trades.clear()
             self.today_pnl = 0.0
             self._5d_vol_cache.clear()
+            self._intraday_cache.clear()
+            self._daily_cache.clear()
             self.status = "PRE-MARKET WARMUP (Standing by for 09:45 AM Entry)"
 
         if time_str < "09:15" or time_str > "15:30":
@@ -901,7 +930,7 @@ class F12CausalEngine:
         for slot_id in ("A", "B"):
             pos = self.active_positions.get(slot_id)
             if pos:
-                bars_1m = self.fetch_live_1min_bars(pos["isin"])
+                bars_1m = self._intraday_cache.get(pos["isin"]) or self.fetch_live_1min_bars(pos["isin"])
                 self.catch_up_slot_bars(slot_id, bars_1m, time_str)
 
         if time_str >= "15:20" and not self.eod_done:
@@ -940,7 +969,7 @@ class F12CausalEngine:
         for slot_id in ("A", "B"):
             pos = self.active_positions.get(slot_id)
             if pos:
-                bars_1m = self.fetch_live_1min_bars(pos["isin"])
+                bars_1m = self._intraday_cache.get(pos["isin"]) or self.fetch_live_1min_bars(pos["isin"])
                 self.catch_up_slot_bars(slot_id, bars_1m, time_str)
 
 
