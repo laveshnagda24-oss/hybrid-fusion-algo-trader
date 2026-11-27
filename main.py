@@ -49,6 +49,8 @@ HEADERS = {
 
 SLIPPAGE = 0.0005  # 0.05% adverse slippage on entry and exit
 MIN_VOL_MULT = 5.0 # Strict liquidity guard: entry 1m bar volume >= 5.0 * qty
+MIN_TURNOVER_LOG = 19.70    # #24 Rule 1: >= ~Rs 36 Cr 30m/60m rupee turnover
+SLOT_A_MAX_SEC_RET = 0.60   # #24 Rule 2: Skip Slot A 09:45 SHORT if sector > +0.60%
 _UPSTOX_LOCK = threading.Lock()
 _UPSTOX_LAST_REQ = 0.0
 _UPSTOX_MIN_INTERVAL = 0.15  # ~6.5 req/sec max to prevent HTTP 429 rate limits
@@ -661,9 +663,26 @@ class F12CausalEngine:
                 if rc:
                     self.enter_position("B", rc, br, tr, "10:15", 0.5)
 
+    def passes_rule24(self, slot_id, cand, tier_name, direction):
+        """Enforces #24: turnover_log >= 19.70 on all entries + Slot A 09:45 SHORT sec_ret <= +0.60%."""
+        tlog = float(cand.get("turnover_log", 0.0))
+        if tlog < MIN_TURNOVER_LOG:
+            logger.info(f"[Slot {slot_id} #24 SKIP] {cand['symbol']} turnover_log={tlog:.2f} < {MIN_TURNOVER_LOG:.2f}. Holding cash.")
+            self.slot_filled_today[slot_id] = True
+            return False
+        if slot_id == "A" and direction == "SHORT" and tier_name in ("T2_CHAMP2_0945", "T3_POOL_A_0945"):
+            sret = float(cand.get("sec_ret", 0.0))
+            if sret > SLOT_A_MAX_SEC_RET:
+                logger.info(f"[Slot A #24 SKIP] {cand['symbol']} sec_ret={sret:+.2f}% > +{SLOT_A_MAX_SEC_RET:.2f}%. Holding cash.")
+                self.slot_filled_today["A"] = True
+                return False
+        return True
+
     def enter_position(self, slot_id, cand, bracket_name, tier_name, entry_time_str, scale=1.0):
         b = BRACKETS[bracket_name]
         direction = b["direction"]
+        if not self.passes_rule24(slot_id, cand, tier_name, direction):
+            return
         sym = cand["symbol"]
         raw_ep = cand["entry_open"]
         entry_vol = cand["entry_vol"]
@@ -1011,7 +1030,7 @@ def ping():
     now_ist = datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     return {
         "status": "online",
-        "strategy": "F12_CAUSAL_5xVol (2 Trades/Day: W12 + FINAL_C1 @ 09:45 & 10:15 OPEN)",
+        "strategy": "F12_CAUSAL_5xVol_R24 (#24: tlog>=19.70 + SlotA sec<=0.60)",
         "time_ist": now_ist,
         "engine_status": engine.status,
         "daily_budget": f"Rs {engine.capital_base:,.2f}",
@@ -1025,7 +1044,7 @@ def ping():
 @app.get("/api/state")
 def get_state():
     return {
-        "strategy": "F12_CAUSAL_5xVol (2 Trades/Day: W12 + FINAL_C1)",
+        "strategy": "F12_CAUSAL_5xVol_R24 (#24: tlog>=19.70 + SlotA sec<=0.60)",
         "status": engine.status,
         "last_update": engine.last_update_ist,
         "capital_base": engine.capital_base,
