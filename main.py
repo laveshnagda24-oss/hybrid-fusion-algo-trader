@@ -2,8 +2,8 @@
 main.py
 ================================================================================
 CLOUD PRODUCTION LIVE & PAPER TRADING SERVER (RENDER.COM + TURSO PERSISTENCE)
-STRATEGY: F12_CAUSAL_5xVol (2 TRADES / DAY: SLOT A W12 + SLOT B FINAL_C1)
-Fixed ₹60,000 Base Capital (2 x ₹30,000) | 5x MIS Leverage (₹1,50,000 / 1.0x Slot)
+STRATEGY: ML_RidgePnL_Ranker(reg=200) + Single-Stock Whole Capital (Rs 3.0L)
+Fixed ₹60,000 Base Capital (2 x ₹30,000 | or 1 x ₹60,000 on 1-Stock Days) @ 5x MIS Leverage
 Strict Causal Waterfall: 09:45 OPEN (Tiers 1-3) -> 10:15 OPEN (Tiers 4-5) | 15:20 EOD
 Liquidity Guard: Entry 1m Bar Volume >= 5.0 * Order Qty | 0.05% Slippage + 2026 MIS Costs
 ================================================================================
@@ -51,6 +51,21 @@ SLIPPAGE = 0.0005  # 0.05% adverse slippage on entry and exit
 MIN_VOL_MULT = 5.0 # Strict liquidity guard: entry 1m bar volume >= 5.0 * qty
 MIN_TURNOVER_LOG = 19.70    # #24 Rule 1: >= ~Rs 36 Cr 30m/60m rupee turnover
 SLOT_A_MAX_SEC_RET = 0.60   # #24 Rule 2: Skip Slot A 09:45 SHORT if sector > +0.60%
+
+# Frozen ML_RidgePnL_Ranker(alpha=200.0) trained strictly on 2022-01-18..2024-12-31 (N=2,050)
+RIDGE_FEATS = (
+    "open_gap", "atr10", "rsi14", "dist_vwap", "rel_vol_5d",
+    "mkt_ret", "sec_ret", "sec_rel_str", "turnover_log", "rel_tlog_20d",
+)
+RIDGE_MU = np.array([1.67608896, 4.87991441, 35.05966362, -0.64249644, 3.06245563, -0.11848684, -0.14853918, -0.34542994, 20.68356411, 0.87062326], dtype=np.float64)
+RIDGE_SD = np.array([1.43992685, 1.45412207, 9.58023429, 0.75802366, 8.70444883, 0.5289567, 0.75580796, 1.95170938, 0.79527581, 1.10374815], dtype=np.float64)
+RIDGE_W = np.array([0.06175858, 0.05319807, 0.00705039, -0.01790663, 0.1725948, 0.02586241, 0.02705199, 0.03492801, 0.07684929, -0.05366564], dtype=np.float64)
+RIDGE_BIAS = 0.29873225
+
+
+def score_ridge_pnl_ranker(rec) -> float:
+    vec = np.array([float(rec.get(f, 0.0) or 0.0) for f in RIDGE_FEATS], dtype=np.float64)
+    return float(((vec - RIDGE_MU) / RIDGE_SD) @ RIDGE_W + RIDGE_BIAS)
 _UPSTOX_LOCK = threading.Lock()
 _UPSTOX_LAST_REQ = 0.0
 _UPSTOX_MIN_INTERVAL = 0.15  # ~6.5 req/sec max to prevent HTTP 429 rate limits
@@ -221,6 +236,7 @@ class F12CausalEngine:
         self.eod_done = False
 
         self._5d_vol_cache = {}  # (isin, n_bars) -> mean 5d window volume
+        self._20d_tlog_cache = {}  # isin -> mean 20d 30m turnover_log
         self._intraday_cache = {}
         self._daily_cache = {}
 
@@ -302,21 +318,37 @@ class F12CausalEngine:
         if key in self._5d_vol_cache:
             return self._5d_vol_cache[key]
         end_dt = (datetime.datetime.strptime(today_str, "%Y-%m-%d") - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        start_dt = (datetime.datetime.strptime(today_str, "%Y-%m-%d") - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
+        start_dt = (datetime.datetime.strptime(today_str, "%Y-%m-%d") - datetime.timedelta(days=34)).strftime("%Y-%m-%d")
         url = f"https://api.upstox.com/v2/historical-candle/NSE_EQ%7C{isin}/1minute/{end_dt}/{start_dt}"
         candles = self._fetch_upstox_candles(url)
         if candles:
             by_day = {}
             for c in candles:
                 d_str = str(c[0])[:10]
-                by_day.setdefault(d_str, []).append(float(c[5]))
-            last_5 = sorted(by_day.keys())[-5:]
-            vols = [sum(by_day[d][:n_bars]) for d in last_5 if len(by_day[d]) >= n_bars]
+                by_day.setdefault(d_str, []).append(c)
+            sorted_days = sorted(by_day.keys())
+            last_5 = sorted_days[-5:]
+            vols = [sum(float(b[5]) for b in by_day[d][:n_bars]) for d in last_5 if len(by_day[d]) >= n_bars]
             if vols:
-                avg_v = float(np.mean(vols))
-                self._5d_vol_cache[key] = avg_v
-                return avg_v
+                self._5d_vol_cache[key] = float(np.mean(vols))
+            last_20 = sorted_days[-20:]
+            tlogs30 = []
+            for d in last_20:
+                bars_d = by_day[d][:30]
+                if len(bars_d) >= 30:
+                    turn30 = sum(float(b[4]) * float(b[5]) for b in bars_d)
+                    if turn30 > 0:
+                        tlogs30.append(float(np.log1p(turn30)))
+            if tlogs30:
+                self._20d_tlog_cache[isin] = float(np.mean(tlogs30))
+            return self._5d_vol_cache.get(key)
         return None
+
+    def fetch_20d_avg_30m_tlog(self, isin, today_str):
+        if isin in self._20d_tlog_cache:
+            return self._20d_tlog_cache[isin]
+        self.fetch_5d_avg_window_vol(isin, today_str, 30)
+        return self._20d_tlog_cache.get(isin)
 
     def compute_window_features(self, bars_1m, daily_bars, n_bars, avg_5d_vol=None):
         """
@@ -550,13 +582,32 @@ class F12CausalEngine:
             t1_bracket = "L_SL2.00_1LEG_TP3.6"
             t1_tier = "T1_S3_LONG_R2"
 
-        # Slot A (W12)
+        # Enrich qualifying 09:45 Tier 2/3 short candidates with rel_vol_5d & rel_tlog_20d and rank via ML_RidgePnL_Ranker(reg=200)
+        for r in records:
+            if (
+                r["atr10"] >= 3.30
+                and r["turnover_log"] >= MIN_TURNOVER_LOG
+                and ((r["open_gap"] >= 0.60 and r["rsi14"] <= 48.0) or (r["open_gap"] >= 0.80 and r["dist_vwap"] <= -0.25))
+            ):
+                avg_v = self.fetch_5d_avg_window_vol(r["isin"], today_str, 30)
+                if avg_v and avg_v > 0:
+                    r["rel_vol_5d"] = r["cum_vol"] / avg_v
+                avg_t20 = self.fetch_20d_avg_30m_tlog(r["isin"], today_str)
+                r["rel_tlog_20d"] = (r["turnover_log"] - avg_t20) if (avg_t20 is not None) else 0.0
+                r["ridge_score"] = score_ridge_pnl_ranker(r)
+            else:
+                r["rel_tlog_20d"] = 0.0
+                r["ridge_score"] = -999.0
+        records_ml = sorted(records, key=lambda x: (-x["ridge_score"], x["symbol"]))
+
+        # Determine Slot A & Slot B 09:45 selections
+        plan_a = None  # (cand, bracket, tier, skip_by_r24)
         if not self.slot_filled_today["A"]:
             if t1_pick:
-                self.enter_position("A", t1_pick, t1_bracket, t1_tier, "09:45", 1.0)
+                plan_a = (t1_pick, t1_bracket, t1_tier, not self.passes_rule24_check("A", t1_pick, t1_tier, BRACKETS[t1_bracket]["direction"]))
             else:
                 pick_a = self.pick_first_valid(
-                    records,
+                    records_ml,
                     lambda x: x["open_gap"] >= 0.80 and x["rsi14"] <= 48.0 and x["atr10"] >= 3.30,
                     self.slot_exposure,
                     "SHORT",
@@ -564,24 +615,22 @@ class F12CausalEngine:
                 tier_a = "T2_CHAMP2_0945"
                 if not pick_a:
                     pick_a = self.pick_first_valid(
-                        records,
+                        records_ml,
                         lambda x: x["open_gap"] >= 0.60 and x["rsi14"] <= 48.0 and x["atr10"] >= 3.30,
                         self.slot_exposure,
                         "SHORT",
                     )
                     tier_a = "T3_POOL_A_0945"
                 if pick_a:
-                    self.enter_position("A", pick_a, "S_SL1.80_TP3.0_4.8_R0.2", tier_a, "09:45", 1.0)
-                else:
-                    logger.info("[Slot A] No 09:45 setup qualified. Holding cash for 10:15 causal scan.")
+                    plan_a = (pick_a, "S_SL1.80_TP3.0_4.8_R0.2", tier_a, not self.passes_rule24_check("A", pick_a, tier_a, "SHORT"))
 
-        # Slot B (FINAL_C1)
+        plan_b = None
         if not self.slot_filled_today["B"]:
             if t1_pick:
-                self.enter_position("B", t1_pick, t1_bracket, t1_tier, "09:45", 1.0)
+                plan_b = (t1_pick, t1_bracket, t1_tier, not self.passes_rule24_check("B", t1_pick, t1_tier, BRACKETS[t1_bracket]["direction"]))
             else:
                 pick_b = self.pick_first_valid(
-                    records,
+                    records_ml,
                     lambda x: (
                         ((x["open_gap"] >= 0.60 and x["rsi14"] <= 48.0) or (x["open_gap"] >= 0.80 and x["dist_vwap"] <= -0.25))
                         and x["atr10"] >= 3.30
@@ -591,9 +640,29 @@ class F12CausalEngine:
                     "SHORT",
                 )
                 if pick_b:
-                    self.enter_position("B", pick_b, "S_SL1.80_TP3.0_4.8_R0.2", "T2_UNION_SEC_0945", "09:45", 1.0)
-                else:
-                    logger.info("[Slot B] No 09:45 setup qualified. Holding cash for 10:15 causal scan.")
+                    plan_b = (pick_b, "S_SL1.80_TP3.0_4.8_R0.2", "T2_UNION_SEC_0945", not self.passes_rule24_check("B", pick_b, "T2_UNION_SEC_0945", "SHORT"))
+
+        # Execute 09:45 trades: if both slots qualify on the SAME unique stock, merge into 1x Whole Capital (Rs 3.0L, fallback 1.0x)
+        ok_a = plan_a and (not plan_a[3])
+        ok_b = plan_b and (not plan_b[3])
+        if ok_a and ok_b and plan_a[0]["symbol"] == plan_b[0]["symbol"]:
+            cand_m, br_m, tr_m, _ = plan_a
+            dir_m = BRACKETS[br_m]["direction"]
+            if self.passes_liquidity_guard(cand_m, self.slot_exposure * 2.0, dir_m):
+                logger.info(f"[Whole Capital Rs 3.0L] Both slots picked {cand_m['symbol']} -> placing 1x Rs 3.0L trade in Slot A.")
+                self.enter_position("A", cand_m, br_m, tr_m, "09:45", 2.0)
+                self.slot_filled_today["B"] = True
+                return
+
+        if plan_a:
+            self.enter_position("A", plan_a[0], plan_a[1], plan_a[2], "09:45", 1.0)
+        elif not self.slot_filled_today["A"]:
+            logger.info("[Slot A] No 09:45 setup qualified. Holding cash for 10:15 causal scan.")
+
+        if plan_b:
+            self.enter_position("B", plan_b[0], plan_b[1], plan_b[2], "09:45", 1.0)
+        elif not self.slot_filled_today["B"]:
+            logger.info("[Slot B] No 09:45 setup qualified. Holding cash for 10:15 causal scan.")
 
     def scan_market_1015(self):
         if self.scan_1015_done:
@@ -647,21 +716,52 @@ class F12CausalEngine:
                 return rc, "S_SL1.40_TP2.4_4.0_R0.3", "T5_CATCH_15S"
             return None, None, None
 
+        plan15_a = None
         if need_a:
             if rev_pick:
-                self.enter_position("A", rev_pick, "L_SL1.80_TP3.0_4.8_R0.2", "T4_1015_REV", "10:15", 1.0)
+                plan15_a = (rev_pick, "L_SL1.80_TP3.0_4.8_R0.2", "T4_1015_REV", 1.0)
             else:
                 rc, br, tr = pick_catch_all(1.0)
                 if rc:
-                    self.enter_position("A", rc, br, tr, "10:15", 1.0)
+                    plan15_a = (rc, br, tr, 1.0)
 
+        plan15_b = None
         if need_b:
             if rev_pick:
-                self.enter_position("B", rev_pick, "L_SL1.80_TP3.0_4.8_R0.2", "T4_1015_REV", "10:15", 1.0)
+                plan15_b = (rev_pick, "L_SL1.80_TP3.0_4.8_R0.2", "T4_1015_REV", 1.0)
             else:
                 rc, br, tr = pick_catch_all(0.5)
                 if rc:
-                    self.enter_position("B", rc, br, tr, "10:15", 0.5)
+                    plan15_b = (rc, br, tr, 0.5)
+
+        # If neither slot was filled at 09:45 and 10:15 yields 1 unique stock, deploy Whole Capital (Rs 3.0L, fallback 1.0x/0.5x)
+        if need_a and need_b:
+            ok15_a = plan15_a and self.passes_rule24_check("A", plan15_a[0], plan15_a[2], BRACKETS[plan15_a[1]]["direction"])
+            ok15_b = plan15_b and self.passes_rule24_check("B", plan15_b[0], plan15_b[2], BRACKETS[plan15_b[1]]["direction"])
+            syms15 = list(dict.fromkeys([p[0]["symbol"] for ok, p in ((ok15_a, plan15_a), (ok15_b, plan15_b)) if ok]))
+            if len(syms15) == 1:
+                primary = plan15_a if ok15_a else plan15_b
+                cand_m, br_m, tr_m, _ = primary
+                dir_m = BRACKETS[br_m]["direction"]
+                if self.passes_liquidity_guard(cand_m, self.slot_exposure * 2.0, dir_m):
+                    logger.info(f"[Whole Capital Rs 3.0L] 10:15 single stock {cand_m['symbol']} -> placing 1x Rs 3.0L trade in Slot A.")
+                    self.enter_position("A", cand_m, br_m, tr_m, "10:15", 2.0)
+                    self.slot_filled_today["B"] = True
+                    return
+
+        if plan15_a:
+            self.enter_position("A", plan15_a[0], plan15_a[1], plan15_a[2], "10:15", plan15_a[3])
+        if plan15_b:
+            self.enter_position("B", plan15_b[0], plan15_b[1], plan15_b[2], "10:15", plan15_b[3])
+
+    def passes_rule24_check(self, slot_id, cand, tier_name, direction):
+        tlog = float(cand.get("turnover_log", 0.0))
+        if tlog < MIN_TURNOVER_LOG:
+            return False
+        if slot_id == "A" and direction == "SHORT" and tier_name in ("T2_CHAMP2_0945", "T3_POOL_A_0945"):
+            if float(cand.get("sec_ret", 0.0)) > SLOT_A_MAX_SEC_RET:
+                return False
+        return True
 
     def passes_rule24(self, slot_id, cand, tier_name, direction):
         """Enforces #24: turnover_log >= 19.70 on all entries + Slot A 09:45 SHORT sec_ret <= +0.60%."""
@@ -1159,8 +1259,8 @@ def dashboard():
         <div class="container">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                 <div>
-                    <h2 style="margin: 0;">F12_CAUSAL_5xVol 2-Slot Engine</h2>
-                    <span style="color: #94a3b8; font-size: 13px;">2 Trades/Day (W12 + FINAL_C1) @ 09:45 & 10:15 OPEN | Fixed Rs 60,000/Day | Vol >= 5x Qty</span>
+                    <h2 style="margin: 0;">ML_RidgePnL_Ranker(reg=200) + Whole Capital</h2>
+                    <span style="color: #94a3b8; font-size: 13px;">Ridge(alpha=200) Ranker + Rs 3.0L 1-Stock Whole Capital @ 09:45 & 10:15 OPEN | Vol >= 5x Qty</span>
                 </div>
                 <div style="text-align: right;">
                     <span style="background: #10b981; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: bold;">LIVE PRODUCTION</span>
